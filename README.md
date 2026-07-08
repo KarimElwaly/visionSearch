@@ -106,6 +106,9 @@ Open **http://localhost:8420** in your browser.
   - ✅ **CLIP Embeddings** — vector embeddings + DINOv2 + FaceNet (recommended)
   - ✅ **VLM Captions** — Ollama generates text descriptions (slower, optional)
 - Click **Start Indexing** and watch the progress bar
+- Click **Cancel** to pause; the job resumes automatically on the next indexing call
+- If a video fails, its row is marked `failed` (with error message) and can be retried
+  via `POST /api/videos/{id}/reindex`
 
 ### 2. Text Search
 - Type a natural language query:
@@ -133,10 +136,15 @@ Open **http://localhost:8420** in your browser.
 | `POST` | `/api/search-by-image` | Image similarity search (multipart file upload) |
 | `POST` | `/api/search-by-person` | Person re-identification (multipart file upload) |
 | `POST` | `/api/index` | Start indexing (body: `{path, use_vlm, use_clip}`) |
-| `GET` | `/api/status` | Get indexing progress |
+| `POST` | `/api/index/cancel` | Cooperatively stop the current indexing job (state → `paused`) |
+| `GET` | `/api/status` | Get current indexing progress |
+| `GET` | `/api/health` | Lightweight readiness probe (no model calls) |
 | `GET` | `/api/videos` | List all indexed videos |
-| `DELETE` | `/api/videos/{id}` | Remove video from index |
-| `GET` | `/api/frame?path=...` | Serve frame/crop image |
+| `GET` | `/api/videos/{id}` | Per-video details + row-count stats |
+| `POST` | `/api/videos/{id}/reindex` | Purge derived data + re-index from source |
+| `DELETE` | `/api/videos/{id}` | Cascade delete: DB rows + FAISS vectors + frames dir |
+| `GET` | `/api/storage` | Per-video row counts (frames / detections / faces) |
+| `GET` | `/api/frame?path=...` | Serve frame or crop image (path-traversal safe) |
 
 ## Configuration
 
@@ -150,9 +158,56 @@ CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 CLIP_MEGA_BATCH = 64           # Frames processed simultaneously (GPU batch size)
 PERSON_MATCH_THRESHOLD = 0.55  # DINOv2 cosine similarity threshold
 FACE_MATCH_THRESHOLD = 0.50    # FaceNet cosine similarity threshold
+FRAME_JPEG_QUALITY = 85        # On-disk frame quality (Phase 5)
+CROP_JPEG_QUALITY = 85         # On-disk detection-crop quality
+FACE_JPEG_QUALITY = 90         # On-disk face-crop quality (higher = preserve identity cues)
 OLLAMA_VLM_MODEL = "qwen3-vl:2b"
 PORT = 8420
 ```
+
+## Scalability & Resilience
+
+Designed to handle **multi-hour videos** and large corpora without falling over:
+
+- **FAISS HNSW + IDMap2** — sublinear search (M=32, efSearch=64) with stable ids that
+  survive restarts and deletions. Legacy `IndexFlatIP` files auto-migrate on first load.
+  A `.faiss.meta.json` sidecar records `dim / count / next_id / saved_at` for integrity checks.
+- **Atomic saves** — every FAISS write is `.tmp` → `os.replace()`, so a crash mid-save cannot corrupt the index.
+- **Checkpoint / resume** — the indexer persists `videos.last_frame_number` + `frames_processed` after each mega-batch
+  and flushes FAISS to disk every 5 mega-batches. Restarting a crashed / paused job resumes near the last checkpoint
+  (uses `MAX(frame_number)` as ground truth).
+- **Bounded RAM per mega-batch** — heavy per-frame buffers (`frame_bgr_ref`, `crop_images`) are freed immediately
+  after each flush, so peak memory does not grow with video length.
+- **Failure isolation** — exceptions during indexing set `videos.status='failed'` with the message stored in
+  `videos.error_message`; the API stays healthy and the row can be re-indexed via `POST /api/videos/{id}/reindex`.
+- **Cancellation** — `POST /api/index/cancel` cooperatively stops the current job after the in-flight batch;
+  status becomes `paused` and the next indexing call resumes automatically.
+- **Drift-safe seeking** — `cap.set(CAP_PROP_POS_FRAMES, n)` is checked for drift and falls back to sequential
+  `cap.grab()` on codecs where seeking is inaccurate (variable-GOP h.264 with B-frames).
+- **Cascade delete** — removing a video via the API deletes DB rows (`ON DELETE CASCADE`), FAISS vectors
+  (via `remove_ids` or reconstruct-rebuild for HNSW), the on-disk `data/frames/{id}` directory, and runs
+  `VACUUM/ANALYZE` to reclaim SQLite pages.
+- **SQLite indexes** — covering indexes on `frames(video_id)`, `detections(faiss_id | person_faiss_id | frame_id)`,
+  `faces(face_faiss_id | detection_id)`, `frame_embeddings(faiss_id)`, plus a unique constraint on
+  `frames(video_id, frame_number)`. `PRAGMA journal_mode=WAL / synchronous=NORMAL / temp_store=MEMORY`.
+
+## Search Quality
+
+- **Prompt-template ensemble** — CLIP text queries are averaged over multiple templates
+  (`"a photo of {q}"`, `"a picture of {q}"`, …) for +2–5 pts recall on retrieval-style queries.
+- **Attribute-preserving parsing** — color words (`black`, `white`, `red`, …) are **not** treated as stopwords
+  when constructing YOLO-World classes, so `"black jacket"` searches for black jackets rather than any jacket.
+- **Negative prompts** — `"person with jacket --no hat"` subtracts the negative embedding at 0.5 strength.
+- **YOLO-World re-rank** operates on detection crops (when available) instead of full frames, avoiding
+  background-object noise.
+- **BM25 normalization** — FTS scores are transformed to `1 / (1 + |rank|)` so text and CLIP scores merge
+  cleanly instead of having text scores dominate.
+- **Person search** — FaceNet is only invoked when YOLO-Face actually detects a face in the query image,
+  preventing meaningless embeddings from non-face inputs.
+- **Temporal continuity boost** — results in a cluster (±3s in the same video) get +20 %, isolated hits
+  get −10 % (real objects persist, glitches don't).
+- **Near-duplicate clustering** — result cards from the same video within ±2 frames are collapsed into
+  a single card with a `+N` badge showing sibling count.
 
 ## Performance
 

@@ -41,8 +41,9 @@ FACE_REC_DIM = 512 # FaceNet InceptionResnetV1 for identity
 
 # Matching thresholds (Cosine Similarity)
 # Dedicated foundation models are highly sensitive; thresholds are tuned for metric learning spaces.
-PERSON_MATCH_THRESHOLD = 0.55  # DINOv2 similarity
+PERSON_MATCH_THRESHOLD = 0.72  # DINOv2 body similarity (raised: avoids false positives from similar clothing)
 FACE_MATCH_THRESHOLD = 0.50    # FaceNet similarity
+BODY_ONLY_DISCOUNT = 0.6       # Discount factor for body-only results (no face confirmation)
 
 
 # Ollama VLM (for rich text descriptions)
@@ -51,6 +52,13 @@ OLLAMA_VLM_MODEL = "qwen3-vl:2b"  # qwen3.5:0.8b doesn't process images. qwen3-v
 
 # Search
 DEFAULT_TOP_K = 20
+
+# On-disk frame + crop storage (Phase 5).
+# Full frames tend to have detail across the whole image, crops are already small,
+# and face crops need to preserve identity cues — hence three settings.
+FRAME_JPEG_QUALITY = 85
+CROP_JPEG_QUALITY = 85
+FACE_JPEG_QUALITY = 90
 
 # Server
 HOST = "0.0.0.0"

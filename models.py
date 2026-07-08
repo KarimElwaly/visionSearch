@@ -5,8 +5,25 @@ import numpy as np
 import requests
 from PIL import Image
 from functools import lru_cache
+from contextlib import nullcontext
 
 import config
+
+
+def _get_device():
+    import torch
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _autocast():
+    """Return a torch.autocast context on CUDA, or a no-op context on CPU.
+
+    Prevents ``RuntimeError: autocast can't be used with 'cuda' on CPU-only PyTorch``.
+    """
+    import torch
+    if _get_device() == "cuda":
+        return torch.autocast("cuda")
+    return nullcontext()
 
 
 # ---- CLIP Model (for fast vector search) ----
@@ -39,7 +56,7 @@ def encode_images_clip(images: list) -> np.ndarray:
         batch = images[i:i + config.CLIP_BATCH_SIZE]
         inputs = processor(images=batch, return_tensors="pt", padding=True).to(model.device)
         with torch.no_grad():
-            with torch.autocast('cuda'):
+            with _autocast():
                 output = model.get_image_features(**inputs)
         # transformers 5.x returns BaseModelOutputWithPooling; older returns tensor
         embeds = output.pooler_output if hasattr(output, 'pooler_output') else output
@@ -54,7 +71,7 @@ def encode_text_clip(text: str) -> np.ndarray:
     model, processor = _load_clip()
     inputs = processor(text=[text], return_tensors="pt", padding=True).to(model.device)
     with torch.no_grad():
-        with torch.autocast('cuda'):
+        with _autocast():
             output = model.get_text_features(**inputs)
     # transformers 5.x returns BaseModelOutputWithPooling; older returns tensor
     embeds = output.pooler_output if hasattr(output, 'pooler_output') else output
@@ -251,11 +268,6 @@ def detect_faces_batch(frames_bgr: list) -> list:
         return [[] for _ in frames_bgr]
 
 
-def _get_device():
-    import torch
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
 # ---- Biometric Re-ID (Body Appearance) ----
 
 _dinov2_model = None
@@ -278,12 +290,13 @@ def _load_dinov2():
 
 
 def encode_person_reid(images: list) -> np.ndarray:
-    """Encode person crops with DINOv2 (True visual Re-ID)."""
+    """Encode person crops with DINOv2 (True visual Re-ID). Fully batched."""
     import torch
     from torchvision import transforms
     model = _load_dinov2()
-    if model is None: return np.zeros((len(images), config.REID_DIM), dtype="float32")
-    
+    if model is None or not images:
+        return np.zeros((len(images), config.REID_DIM), dtype="float32")
+
     device = _get_device()
     # DINOv2 standard preprocessing requires multiple of 14 for patch size
     preprocess = transforms.Compose([
@@ -291,17 +304,19 @@ def encode_person_reid(images: list) -> np.ndarray:
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    
-    all_embeddings = []
-    for img in images:
-        inp = preprocess(img).unsqueeze(0).to(device)
+
+    # Batch preprocess + chunked forward pass for GPU OOM safety
+    tensors = [preprocess(img) for img in images]
+    out = np.zeros((len(images), config.REID_DIM), dtype="float32")
+    batch_size = 32
+    for i in range(0, len(tensors), batch_size):
+        batch = torch.stack(tensors[i:i + batch_size]).to(device)
         with torch.no_grad():
-            with torch.autocast('cuda'):
-                feat = model(inp)
-        feat = feat / feat.norm(dim=-1, keepdim=True)
-        all_embeddings.append(feat.cpu().numpy())
-    
-    return np.vstack(all_embeddings).astype("float32")
+            with _autocast():
+                feats = model(batch)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        out[i:i + batch.shape[0]] = feats.cpu().float().numpy()
+    return out
 
 
 # ---- Face Recognition (Identity) ----
@@ -360,7 +375,7 @@ def encode_face_identity(frame_bgr: np.ndarray, bbox: tuple) -> np.ndarray:
     
     inp = preprocess(face_pil).unsqueeze(0).to(device)
     with torch.no_grad():
-        with torch.autocast('cuda'):
+        with _autocast():
             emb = model(inp)
     
     emb = emb / emb.norm(dim=-1, keepdim=True)
@@ -406,12 +421,12 @@ def encode_faces_batch(face_crops_bgr: list) -> np.ndarray:
     for i in range(0, len(tensors), batch_size):
         batch_tensors = torch.stack(tensors[i:i+batch_size]).to(device)
         with torch.no_grad():
-            with torch.autocast('cuda'):
+            with _autocast():
                 emb = model(batch_tensors)
         emb = emb / emb.norm(dim=-1, keepdim=True)
         
         for j, valid_idx in enumerate(valid_indices[i:i+batch_size]):
-            out_embeddings[valid_idx] = emb[j].cpu().numpy()
+            out_embeddings[valid_idx] = emb[j].cpu().float().numpy()
             
     return out_embeddings
 

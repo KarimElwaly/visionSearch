@@ -14,7 +14,9 @@ def get_connection() -> sqlite3.Connection:
         _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
         _local.conn.execute("PRAGMA foreign_keys=ON")
+        _local.conn.execute("PRAGMA temp_store=MEMORY")
     return _local.conn
 
 
@@ -130,6 +132,18 @@ def init_db():
         except Exception:
             pass  # Column already exists
 
+        # Resume-support columns on videos (added in Phase 3 of scalability upgrade).
+        for column, ddl in [
+            ("last_frame_number", "ALTER TABLE videos ADD COLUMN last_frame_number INTEGER DEFAULT 0"),
+            ("frames_processed", "ALTER TABLE videos ADD COLUMN frames_processed INTEGER DEFAULT 0"),
+            ("error_message", "ALTER TABLE videos ADD COLUMN error_message TEXT"),
+        ]:
+            try:
+                conn.execute(ddl)
+                print(f"[db] Migrated: added {column} to videos")
+            except Exception:
+                pass
+
         try:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS faces (
@@ -146,6 +160,61 @@ def init_db():
             """)
         except Exception:
             pass
+
+        # --- Performance indexes (critical at scale) ---
+        # SQLite silently no-ops CREATE INDEX IF NOT EXISTS, so this is safe on repeat runs.
+        conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_frames_video_id ON frames(video_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_frames_video_frameno ON frames(video_id, frame_number);
+            CREATE INDEX IF NOT EXISTS idx_detections_frame_id ON detections(frame_id);
+            CREATE INDEX IF NOT EXISTS idx_detections_faiss_id ON detections(faiss_id);
+            CREATE INDEX IF NOT EXISTS idx_detections_person_faiss_id ON detections(person_faiss_id);
+            CREATE INDEX IF NOT EXISTS idx_faces_face_faiss_id ON faces(face_faiss_id);
+            CREATE INDEX IF NOT EXISTS idx_faces_detection_id ON faces(detection_id);
+            CREATE INDEX IF NOT EXISTS idx_frame_embeddings_faiss_id ON frame_embeddings(faiss_id);
+        """)
+
+
+def vacuum_analyze():
+    """Reclaim space and refresh planner stats. Call after bulk deletes."""
+    with get_db() as conn:
+        # VACUUM cannot run inside a transaction; commit first, then run outside.
+        conn.commit()
+    conn = get_connection()
+    try:
+        conn.execute("VACUUM")
+        conn.execute("ANALYZE")
+    except Exception as e:
+        print(f"[db] vacuum_analyze failed: {e}")
+
+
+def update_video_checkpoint(video_id: int, last_frame_number: int, frames_processed: int):
+    """Persist per-video checkpoint so indexing can resume after a crash."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE videos SET last_frame_number = ?, frames_processed = ? WHERE id = ?",
+            (last_frame_number, frames_processed, video_id)
+        )
+
+
+def set_video_error(video_id: int, error_message: str):
+    """Mark a video as ``failed`` with the exception message. Called from the
+    indexer's outer try/except so crashes don't leave rows stuck in 'indexing'."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE videos SET status = 'failed', error_message = ? WHERE id = ?",
+            (error_message[:2000] if error_message else None, video_id),
+        )
+
+
+def get_max_frame_number(video_id: int) -> int:
+    """Return the largest ``frame_number`` already stored for ``video_id`` (0 if none)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT MAX(frame_number) AS m FROM frames WHERE video_id = ?",
+            (video_id,)
+        ).fetchone()
+    return int(row["m"]) if row and row["m"] is not None else 0
 
 
 # ---- Video CRUD ----
@@ -177,6 +246,66 @@ def get_all_videos():
 def delete_video(video_id: int):
     with get_db() as conn:
         conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+
+
+def get_faiss_ids_for_video(video_id: int) -> dict:
+    """Return all FAISS ids referenced by this video, grouped by index.
+
+    Used by the cascade-delete path to actually remove vectors from FAISS
+    (otherwise deleted content would leak into future searches forever).
+    """
+    with get_db() as conn:
+        det_rows = conn.execute(
+            """SELECT d.faiss_id, d.person_faiss_id
+               FROM detections d
+               JOIN frames f ON f.id = d.frame_id
+               WHERE f.video_id = ?""",
+            (video_id,)
+        ).fetchall()
+        frame_rows = conn.execute(
+            """SELECT fe.faiss_id
+               FROM frame_embeddings fe
+               JOIN frames f ON f.id = fe.frame_id
+               WHERE f.video_id = ?""",
+            (video_id,)
+        ).fetchall()
+        face_rows = conn.execute(
+            """SELECT fc.face_faiss_id
+               FROM faces fc
+               JOIN frames f ON f.id = fc.frame_id
+               WHERE f.video_id = ?""",
+            (video_id,)
+        ).fetchall()
+
+    general = [r["faiss_id"] for r in det_rows if r["faiss_id"] is not None]
+    general += [r["faiss_id"] for r in frame_rows if r["faiss_id"] is not None]
+    person = [r["person_faiss_id"] for r in det_rows if r["person_faiss_id"] is not None]
+    face = [r["face_faiss_id"] for r in face_rows if r["face_faiss_id"] is not None]
+    return {"general": general, "person": person, "face": face}
+
+
+def get_storage_stats() -> dict:
+    """Aggregate per-video counts (rows in each table) for the storage endpoint."""
+    with get_db() as conn:
+        videos = conn.execute("SELECT id, filename, path, duration, status FROM videos").fetchall()
+        rows = []
+        for v in videos:
+            vid = v["id"]
+            frames_n = conn.execute("SELECT COUNT(*) AS n FROM frames WHERE video_id = ?", (vid,)).fetchone()["n"]
+            det_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM detections d JOIN frames f ON f.id = d.frame_id WHERE f.video_id = ?",
+                (vid,)
+            ).fetchone()["n"]
+            face_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM faces fc JOIN frames f ON f.id = fc.frame_id WHERE f.video_id = ?",
+                (vid,)
+            ).fetchone()["n"]
+            rows.append({
+                "id": vid, "filename": v["filename"], "path": v["path"],
+                "duration": v["duration"], "status": v["status"],
+                "frames": frames_n, "detections": det_n, "faces": face_n,
+            })
+    return {"videos": rows}
 
 
 # ---- Frame CRUD ----

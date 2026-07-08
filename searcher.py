@@ -32,6 +32,21 @@ def _load_faiss_index():
 # ---- YOLO-World for open-vocabulary re-ranking ----
 
 _yolo_world_model = None
+_image_search_yolo = None  # cached base YOLO for search_by_image object cropping
+
+
+def _load_image_search_yolo():
+    """Cached base YOLO detector used by search_by_image to crop the primary object.
+
+    Runs on CPU to keep GPU memory free for CLIP / DINOv2 / FaceNet.
+    """
+    global _image_search_yolo
+    if _image_search_yolo is None:
+        from ultralytics import YOLO
+        print(f"[search] Loading base YOLO for image search: {config.YOLO_MODEL_PATH}")
+        _image_search_yolo = YOLO(config.YOLO_MODEL_PATH)
+        _image_search_yolo.to("cpu")
+    return _image_search_yolo
 
 
 def _load_yolo_world():
@@ -64,10 +79,10 @@ def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
         return candidates
 
     # Use the full query (e.g., "black bag") and the core object (e.g., "bag")
-    # This allows YOLO-World to still find the object if it struggles with the color attribute
+    # Colors are meaningful attributes and must NOT be stripped.
     words = query.lower().split()
-    core_nouns = [w for w in words if len(w) > 3 and w not in 
-                  {"with", "wearing", "that", "this", "from", "into", "near", "next", "have", "some", "black", "white", "red", "blue", "green", "yellow"}]
+    core_nouns = [w for w in words if len(w) > 3 and w not in
+                  {"with", "wearing", "that", "this", "from", "into", "near", "next", "have", "some"}]
     
     query_classes = [query.strip()]
     if core_nouns and core_nouns[-1] != query.strip():
@@ -82,12 +97,16 @@ def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
     print(f"[search] YOLO-World classes: {query_classes}")
 
     for candidate in candidates:
-        frame_path = candidate.get("frame_path", "")
-        if not frame_path or not os.path.exists(frame_path):
+        # Always run YOLO-World on the full frame — the query object may be
+        # anywhere in the scene, not necessarily inside a tiny person crop.
+        # (Previously used crop_path for detection results, which killed recall
+        # for scene-object queries like "ring", "bag", "hat".)
+        target_path = candidate.get("frame_path") or candidate.get("crop_path", "")
+        if not target_path or not os.path.exists(target_path):
             continue
 
         try:
-            frame = cv2.imread(frame_path)
+            frame = cv2.imread(target_path)
             if frame is None:
                 continue
 
@@ -121,13 +140,15 @@ def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
                 candidate["yolo_world_conf"] = max_conf
                 candidate["yolo_world_count"] = det_count
             else:
-                # STRONG PENALTY: YOLO-World completely failed to find the object
-                # Drop the score aggressively so it falls below actually matched items
-                candidate["score"] = candidate.get("score", 0) * 0.1
+                # SOFT penalty: YOLO-World didn't find the object, but small
+                # objects (rings, patterns) can escape open-vocab detection.
+                # 0.35 is aggressive enough to demote non-matches below verified
+                # ones but leaves them visible when nothing else matched.
+                candidate["score"] = candidate.get("score", 0) * 0.35
                 candidate["yolo_world_match"] = False
 
         except Exception as e:
-            print(f"[search] YOLO-World error on {frame_path}: {e}")
+            print(f"[search] YOLO-World error on {target_path}: {e}")
 
     # Re-sort by updated score
     candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -168,26 +189,52 @@ def _blend_attributes(query: str) -> np.ndarray:
     return models.encode_text_clip(query)
 
 
+# CLIP prompt templates used for ensemble query encoding (proven +2–5 pts recall
+# on retrieval benchmarks). Kept neutral — forcing a "person" context hurts
+# recall on object queries like "ring", "bag", "car".
+_PROMPT_TEMPLATES = (
+    "{q}",
+    "a photo of {q}",
+    "a picture of {q}",
+    "an image of {q}",
+    "a photo of {q} in a scene",
+)
+
+
+def _prompt_ensemble_embedding(query: str) -> np.ndarray:
+    """Average CLIP text embeddings over a small template ensemble."""
+    embs = []
+    for tmpl in _PROMPT_TEMPLATES:
+        try:
+            embs.append(_blend_attributes(tmpl.format(q=query)))
+        except Exception as e:
+            print(f"[search] prompt ensemble error on '{tmpl}': {e}")
+    if not embs:
+        return _blend_attributes(query)
+    avg = np.mean(np.vstack(embs), axis=0, keepdims=True)
+    return avg / np.linalg.norm(avg, axis=1, keepdims=True)
+
+
 def _get_query_embedding(query: str) -> np.ndarray:
     """
-    Parses negative prompts (--no) and applies attribute blending.
-    Returns forced unit-length embedding.
+    Parses negative prompts (--no) and applies attribute blending +
+    prompt-template ensemble. Returns unit-length embedding.
     """
     query_lower = query.lower()
     if " --no " in query_lower:
         parts = query_lower.split(" --no ", 1)
         pos_query = parts[0].strip()
         neg_query = parts[1].strip()
-        
-        pos_emb = _blend_attributes(pos_query)
-        neg_emb = _blend_attributes(neg_query)
+
+        pos_emb = _prompt_ensemble_embedding(pos_query)
+        neg_emb = _prompt_ensemble_embedding(neg_query)
         
         # Vector Subtraction (Option 2)
         print(f"[search] Negative Prompt applied: '{pos_query}' minus '{neg_query}'")
         blended = pos_emb - (neg_emb * 0.5)  # 0.5 strength for negative
         return blended / np.linalg.norm(blended, axis=1, keepdims=True)
     else:
-        return _blend_attributes(query)
+        return _prompt_ensemble_embedding(query)
 
 
 def _apply_temporal_boosting(results: list) -> list:
@@ -324,14 +371,67 @@ def search(query: str, top_k: int = None, mode: str = "hybrid"):
         
         # We only keep the ones that survived re-ranking
         results = _rerank_with_yolo_world(candidates_to_rerank, query, top_k)
-        
-        # Filter out results that got the massive penalty (score < 0.05)
-        results = [r for r in results if r.get("score", 0) > 0.05]
+
+        # Drop only clearly-noise results. YOLO-World misses on small / rare
+        # objects, so we do NOT filter out non-verified candidates \u2014 they are
+        # already softly demoted by the miss penalty inside the reranker.
+        results = [r for r in results if r.get("score", 0) > 0.01]
 
     # Apply Option 5: Temporal Continuity Boost
     results = _apply_temporal_boosting(results)
 
+    # Collapse near-duplicate thumbnails from the same event
+    results = _cluster_near_duplicates(results)
+
     return results[:top_k]
+
+
+def _color_histogram(img_bgr, bins=16):
+    """Compute a normalized HSV histogram (H+S channels) for color matching."""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Hue (0-179) and Saturation (0-255) capture color identity better than Value
+    hist = cv2.calcHist([hsv], [0, 1], None, [bins, bins], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
+
+
+def _rerank_by_color(results, query_image: Image.Image, weight: float = 0.4):
+    """Re-rank image search results by color histogram similarity to the query.
+
+    Blends the original CLIP score with an HSV color-correlation score:
+        final_score = (1 - weight) * clip_score + weight * color_sim * max_clip_score
+
+    This preserves CLIP's semantic ranking but demotes results with wrong colors.
+    """
+    if not results:
+        return results
+
+    # Convert query to BGR for OpenCV
+    query_bgr = cv2.cvtColor(np.array(query_image), cv2.COLOR_RGB2BGR)
+    query_hist = _color_histogram(query_bgr)
+
+    max_score = max(r.get("score", 0) for r in results) or 1.0
+
+    for r in results:
+        # Load the candidate image
+        path = r.get("crop_path") or r.get("frame_path", "")
+        if not path or not os.path.exists(path):
+            continue
+        cand_bgr = cv2.imread(path)
+        if cand_bgr is None:
+            continue
+        cand_hist = _color_histogram(cand_bgr)
+        # Correlation ranges from -1 to 1; 1 = identical color distribution
+        color_sim = cv2.compareHist(query_hist, cand_hist, cv2.HISTCMP_CORREL)
+        color_sim = max(0.0, color_sim)  # clamp negatives
+
+        clip_score = r.get("score", 0)
+        r["score"] = (1 - weight) * clip_score + weight * color_sim * max_score
+        r["color_similarity"] = round(color_sim, 3)
+
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    print(f"[search] Color re-rank applied (weight={weight})")
+    return results
 
 
 def search_by_image(image: Image.Image, top_k: int = None):
@@ -345,6 +445,7 @@ def search_by_image(image: Image.Image, top_k: int = None):
     results = []
     seen_keys = set()
     min_clip_score = 0.15
+    best_crop = None
 
     index = _load_faiss_index()
     if index is None or index.ntotal == 0:
@@ -354,16 +455,13 @@ def search_by_image(image: Image.Image, top_k: int = None):
         # Option 1: Object-Centric Image Search
         # Use YOLOv11 to find the primary object in the uploaded image and crop out the background.
         # This prevents background noise (e.g. a messy room) from polluting the CLIP embedding.
-        from ultralytics import YOLO
         print("[search] Finding primary object in uploaded image...")
-        
+
         # Convert PIL to CV2 format for YOLO
         cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        yolo_model = YOLO(config.YOLO_MODEL_PATH)
-        yolo_model.to("cpu")
+        yolo_model = _load_image_search_yolo()
         yolo_results = yolo_model(cv_img, conf=0.2, verbose=False)
         
-        best_crop = None
         max_area = 0
         
         for r in yolo_results:
@@ -417,10 +515,17 @@ def search_by_image(image: Image.Image, top_k: int = None):
         print(f"[search] Image search error: {e}")
 
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    
+
+    # --- Color histogram re-ranking ---
+    # CLIP captures semantics ("bag") but not color well. Re-rank by color
+    # similarity so a red-bag query doesn't surface black bags at rank 2.
+    results = _rerank_by_color(results, image if best_crop is None else best_crop)
+
     # Apply Option 5: Temporal Continuity Boost
     results = _apply_temporal_boosting(results)
-    
+
+    results = _cluster_near_duplicates(results)
+
     return results[:top_k]
 
 
@@ -445,10 +550,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
     # Detect and encode face identity using FaceNet
     query_face_emb = None
     faces = models.detect_faces(cv_img)
-    
+
     is_face_crop = False
     best_bbox = None
-    
+
     if faces:
         best_face = max(faces, key=lambda f: (f["bbox"][2]-f["bbox"][0]) * (f["bbox"][3]-f["bbox"][1]))
         best_bbox = best_face["bbox"]
@@ -456,19 +561,16 @@ def search_by_person(image: Image.Image, top_k: int = None):
         if face_area > 0.4 * img_area:
             is_face_crop = True
         print(f"[search] Face detected in query image (conf: {best_face['confidence']:.2f})")
-    else:
-        # YOLO-Face sometimes misses extreme tight crops. Let's assume it *might* be a face
-        # if the aspect ratio is face-like, but to be safe we'll try to encode the whole image as a face.
-        best_bbox = (0, 0, w, h)
-        print("[search] No face detected by YOLO, attempting full-image FaceNet extraction.")
 
-    # Always try to extract face identity from the bbox
-    query_face_emb = models.encode_face_identity(cv_img, best_bbox)
-    # encode_face_identity returns all zeros if it fails
-    if np.all(query_face_emb == 0):
-        query_face_emb = None
+        # Only run FaceNet when a face was actually detected — running it on non-face
+        # imagery produces meaningless embeddings that pollute the face index recall.
+        query_face_emb = models.encode_face_identity(cv_img, best_bbox)
+        if np.all(query_face_emb == 0):
+            query_face_emb = None
+        else:
+            query_face_emb = query_face_emb.reshape(1, -1)
     else:
-        query_face_emb = query_face_emb.reshape(1, -1)
+        print("[search] No face detected by YOLO in query image; skipping FaceNet stage.")
 
     # Encode with DINOv2 (Biometric Re-ID) ONLY if it's not a tight face crop
     query_emb = None
@@ -502,7 +604,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
                     if key not in seen_keys:
                         seen_keys.add(key)
                         result = _format_detection_result(r, source="person_reid")
-                        result["score"] = score_map.get(r["person_faiss_id"], 0)
+                        # Body-only scores are discounted so they never outrank
+                        # face-confirmed results — clothing is not identity.
+                        raw_score = score_map.get(r["person_faiss_id"], 0)
+                        result["score"] = raw_score * config.BODY_ONLY_DISCOUNT
                         result["match_type"] = "body"
                         results.append(result)
 
@@ -565,7 +670,9 @@ def search_by_person(image: Image.Image, top_k: int = None):
     
     # Apply temporal boosting
     results = _apply_temporal_boosting(results)
-    
+
+    results = _cluster_near_duplicates(results)
+
     return results[:top_k]
 
 
@@ -578,6 +685,10 @@ def _build_fts_query(query: str) -> str:
 
 def _format_detection_result(row, source="text"):
     r = dict(row)
+    # FTS5 BM25 rank is negative; smaller value = better match. Normalise to (0,1]
+    # so it can be merged with cosine-similarity CLIP scores without one dominating.
+    raw_rank = r.get("rank")
+    score = 1.0 / (1.0 + abs(raw_rank)) if raw_rank is not None else 0
     return {
         "type": "detection", "source": source,
         "detection_id": r["id"],
@@ -592,12 +703,14 @@ def _format_detection_result(row, source="text"):
         "caption": r.get("caption", ""),
         "bbox": [r.get("bbox_x1", 0), r.get("bbox_y1", 0),
                  r.get("bbox_x2", 0), r.get("bbox_y2", 0)] if r.get("bbox_x1") else None,
-        "score": abs(r["rank"]) if "rank" in r else 0,
+        "score": score,
     }
 
 
 def _format_scene_result(row, source="text"):
     r = dict(row)
+    raw_rank = r.get("rank")
+    score = 1.0 / (1.0 + abs(raw_rank)) if raw_rank is not None else 0
     return {
         "type": "scene", "source": source,
         "frame_path": r["frame_path"],
@@ -610,5 +723,46 @@ def _format_scene_result(row, source="text"):
         "confidence": 1.0,
         "caption": r.get("caption", ""),
         "bbox": None,
-        "score": abs(r["rank"]) if "rank" in r else 0,
+        "score": score,
     }
+
+
+def _cluster_near_duplicates(results: list, window_frames: int = 2) -> list:
+    """Collapse near-duplicate thumbnails (same video, adjacent frames) into one card.
+
+    A single real event often produces multiple detections across consecutive
+    extracted frames; showing all of them wastes result slots. Keeps the best
+    scoring member of each cluster and stores siblings in ``_cluster``.
+    """
+    if not results:
+        return results
+
+    # Sort deterministically by (video, timestamp) so adjacent frames are neighbours.
+    ordered = sorted(results, key=lambda r: (r.get("video_filename") or "",
+                                             float(r.get("frame_number") or 0)))
+    kept: list = []
+    for r in ordered:
+        vid = r.get("video_filename")
+        fno = float(r.get("frame_number") or 0)
+        merged = False
+        for k in kept:
+            if k.get("video_filename") == vid and abs(float(k.get("frame_number") or 0) - fno) <= window_frames:
+                # Prefer higher-scored representative; append the loser to _cluster.
+                loser = r if k.get("score", 0) >= r.get("score", 0) else k
+                winner = k if loser is r else r
+                if winner is r:
+                    kept.remove(k)
+                    kept.append(winner)
+                winner.setdefault("_cluster", []).append({
+                    "frame_number": loser.get("frame_number"),
+                    "timestamp": loser.get("timestamp"),
+                    "score": loser.get("score"),
+                    "frame_path": loser.get("frame_path"),
+                })
+                merged = True
+                break
+        if not merged:
+            kept.append(r)
+
+    kept.sort(key=lambda r: r.get("score", 0), reverse=True)
+    return kept

@@ -26,6 +26,13 @@ const modalOverlay = document.getElementById('modalOverlay');
 const modalImage = document.getElementById('modalImage');
 const modalInfo = document.getElementById('modalInfo');
 const modalClose = document.getElementById('modalClose');
+const cancelIndexBtn = document.getElementById('cancelIndexBtn');
+const loadMoreBtn = document.getElementById('loadMoreBtn');
+
+// ---- Pagination state ----
+let currentTopK = 30;
+const TOP_K_INCREMENT = 30;
+let lastSearch = null;  // { kind: 'text' | 'image' | 'person', payload: ... }
 
 // ---- State ----
 let pollTimer = null;
@@ -127,6 +134,8 @@ document.addEventListener('DOMContentLoaded', () => {
         indexPanel.classList.toggle('open');
     });
     indexBtn.addEventListener('click', startIndexing);
+    if (cancelIndexBtn) cancelIndexBtn.addEventListener('click', cancelIndexing);
+    if (loadMoreBtn) loadMoreBtn.addEventListener('click', loadMoreResults);
 
     // ---- Modal ----
     modalClose.addEventListener('click', closeModal);
@@ -151,10 +160,12 @@ async function doTextSearch() {
     const query = searchInput.value.trim();
     if (!query) return;
 
+    currentTopK = 30;
+    lastSearch = { kind: 'text', payload: query };
     searchBtn.innerHTML = '<span class="spinner"></span>';
     try {
         const mode = searchMode.value;
-        const resp = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=30&mode=${mode}`);
+        const resp = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=${currentTopK}&mode=${mode}`);
         const data = await resp.json();
         showResults(`Results for "${query}"`, data.count, data.results, false);
     } catch (err) {
@@ -167,12 +178,14 @@ async function doTextSearch() {
 // ---- Visual Image Search ----
 async function doImageSearch() {
     if (!pendingImageFile) return;
+    currentTopK = 30;
+    lastSearch = { kind: 'image', payload: pendingImageFile };
     const btn = document.getElementById('imageSearchBtn');
     btn.innerHTML = '<span class="spinner"></span>';
     try {
         const formData = new FormData();
         formData.append('file', pendingImageFile);
-        const resp = await fetch(`${API}/api/search-by-image?top_k=30`, { method: 'POST', body: formData });
+        const resp = await fetch(`${API}/api/search-by-image?top_k=${currentTopK}`, { method: 'POST', body: formData });
         const data = await resp.json();
         showResults(`Visual match: "${pendingImageFile.name}"`, data.count, data.results, false);
     } catch (err) {
@@ -185,12 +198,14 @@ async function doImageSearch() {
 // ---- Person Re-ID Search ----
 async function doPersonSearch() {
     if (!pendingPersonFile) return;
+    currentTopK = 30;
+    lastSearch = { kind: 'person', payload: pendingPersonFile };
     const btn = document.getElementById('personSearchBtn');
     btn.innerHTML = '<span class="spinner"></span>';
     try {
         const formData = new FormData();
         formData.append('file', pendingPersonFile);
-        const resp = await fetch(`${API}/api/search-by-person?top_k=30`, { method: 'POST', body: formData });
+        const resp = await fetch(`${API}/api/search-by-person?top_k=${currentTopK}`, { method: 'POST', body: formData });
         const data = await resp.json();
         showResults(`Person search: "${pendingPersonFile.name}"`, data.count, data.results, true);
     } catch (err) {
@@ -200,12 +215,56 @@ async function doPersonSearch() {
     }
 }
 
+// ---- Load more (pagination) ----
+async function loadMoreResults() {
+    if (!lastSearch) return;
+    currentTopK += TOP_K_INCREMENT;
+    loadMoreBtn.textContent = 'Loading...';
+    try {
+        let data;
+        if (lastSearch.kind === 'text') {
+            const mode = searchMode.value;
+            const resp = await fetch(`${API}/api/search?q=${encodeURIComponent(lastSearch.payload)}&top_k=${currentTopK}&mode=${mode}`);
+            data = await resp.json();
+        } else if (lastSearch.kind === 'image') {
+            const fd = new FormData(); fd.append('file', lastSearch.payload);
+            const resp = await fetch(`${API}/api/search-by-image?top_k=${currentTopK}`, { method: 'POST', body: fd });
+            data = await resp.json();
+        } else {
+            const fd = new FormData(); fd.append('file', lastSearch.payload);
+            const resp = await fetch(`${API}/api/search-by-person?top_k=${currentTopK}`, { method: 'POST', body: fd });
+            data = await resp.json();
+        }
+        resultsCount.textContent = `${data.count} found`;
+        renderResults(data.results, lastSearch.kind === 'person');
+    } catch (err) {
+        console.error('Load more failed:', err);
+    } finally {
+        loadMoreBtn.textContent = 'Load more results';
+    }
+}
+
+// ---- Cancel indexing ----
+async function cancelIndexing() {
+    cancelIndexBtn.disabled = true;
+    cancelIndexBtn.textContent = 'Cancelling...';
+    try {
+        await fetch(`${API}/api/index/cancel`, { method: 'POST' });
+    } catch (err) {
+        console.error('Cancel failed:', err);
+    }
+}
+
 // ---- Show Results ----
 function showResults(title, count, results, isPersonSearch) {
     resultsSection.style.display = 'block';
     resultsTitle.textContent = title;
     resultsCount.textContent = `${count} found`;
     renderResults(results, isPersonSearch);
+    // Show "Load more" if we may have more results server-side.
+    if (loadMoreBtn) {
+        loadMoreBtn.style.display = (results && results.length >= currentTopK) ? '' : 'none';
+    }
     // Scroll to results
     resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -240,6 +299,11 @@ function renderResults(results, isPersonSearch = false) {
             ? matchBadge
             : `<span class="source-badge">${r.source}</span>`;
 
+        const clusterSize = (r._cluster && r._cluster.length) ? r._cluster.length : 0;
+        const clusterBadge = clusterSize > 0
+            ? `<span class="score-badge" style="top:2.2rem;background:#6366f1;">+${clusterSize}</span>`
+            : '';
+
         return `
             <div class="result-card" data-index="${i}" data-frame-src="${frameSrc}">
                 <div class="image-container">
@@ -250,6 +314,7 @@ function renderResults(results, isPersonSearch = false) {
                     </div>
                     <span class="timestamp-badge">${time}</span>
                     ${scorePercent > 0 ? `<span class="score-badge">${scorePercent}%</span>` : ''}
+                    ${clusterBadge}
                 </div>
                 <div class="result-info">
                     ${r.caption && r.caption !== r.class_name ? `<p class="caption">${escapeHtml(r.caption)}</p>` : ''}
@@ -308,6 +373,7 @@ async function startIndexing() {
         }
 
         progressSection.style.display = 'block';
+        if (cancelIndexBtn) { cancelIndexBtn.disabled = false; cancelIndexBtn.textContent = 'Cancel'; }
         startPolling();
     } catch (err) {
         console.error('Index error:', err);
