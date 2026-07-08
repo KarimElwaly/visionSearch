@@ -1,0 +1,20 @@
+6178d439 Fix: Restored per-crop CLIP encoding for search accuracy. Added FAISS index purge on video deletion to prevent desync.
+3bea4990 Optimization: Phase 8 (GPU-side preprocessing & inference_mode). Fixed tensor shape mismatch in DINOv2 batched stack.
+ffe6e10b Optimization: Phase 5 & 6 (CUDA Stream Parallelism, Redundant Clip Elimination, Pinned Memory transfers). 8.1x speedup achieved.
+0db2b1b8 Optimization: Full Batch Inference Pipeline & I/O Threading (5.5x speedup, 4.6GB VRAM saturation)
+02164ba1 Upgrade: Person search to Security-Grade Biometric Pipeline (Pure-PyTorch, DINOv2, FaceNet, FP16 GPU Acceleration)
+ba6b07b0 feat: implement Person Re-ID + Face Recognition with 3-tab search UI
+049764af Optimize video indexing: 5-stage pipeline with frame seeking, stream processing, mega-batch CLIP, threaded I/O, and batch DB inserts. Fixed CLIP compatibility with transformers 5.x.
+af3f3c94 Update vision_search: include error logs and current state
+0853e2e9 feat: implement advanced non-LLM search accuracy pipeline
+b4b3ffb3 feat: implement semantic image search and improve text search accuracy
+a042d6d3 perf: implement plate-size skipping and batch OCR processing
+604b634f perf: reduce Pass 1 inference resolution to 544 for improved CPU speed
+7ccfdd67 perf: optimize CPU video processing and drawing logic
+1507ebb9 feat: implement stable LPR tracking with car-ID association and weighted voting history
+4e770243 Implement modern UI for license plate detection with Arabic text rendering and aggregation
+57d7544d Optimize yoloplate.py: Aggregated character detection and removed confidence scores for better visualization
+1f63f703 Add YOLO-World video detection with smooth box tracking and CPU/GPU support
+e37adee3 feat(plate): improve OCR quality with strict filtering, enhancement and re-optimized detection settings
+036c5c1c feat(plate): add Arabic letter reversal and optimize resolution for faster processing
+77f583cd feat(plate): Enhance OCR stability and filtering (strict arabic letters, numeric check, tracking, skip disabled, tolerance 100)

@@ -1,0 +1,16 @@
+============================================================
+[indexer] DONE: harass.mp4
+[indexer]   Video duration    : 1m 0s
+[indexer]   Indexing time     : 10.9s
+[indexer]   Speed ratio       : 5.5x (1 min video ≈ 11s indexing)
+[indexer]   Frames indexed    : 57
+[indexer]   Frames skipped    : 3 (scene duplicates)
+[indexer]   Objects detected  : 172
+[indexer]   Person vectors    : 674 (Re-ID index)
+[indexer]   Face vectors      : 678 (Face index)
+[indexer]   Avg speed         : 5.22 frames/s
+[indexer]   ---
+[indexer]   Projection: 10 min video ≈ 1m 49s
+[indexer]   Projection: 1 hr video  ≈ 10m 54s
+[indexer]   Projection: 2 hr video  ≈ 21m 49s
+=====================================================

@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+transformers
+torch
+torchvision
+Pillow
+opencv-python
+faiss-cpu
+requests
+numpy
+ultralytics
+facenet-pytorch
+git+https://github.com/openai/CLIP.git

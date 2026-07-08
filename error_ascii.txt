@@ -1,0 +1,108 @@
+..\.venv\Scripts\python : 
+Skipping import of cpp 
+extensions due to 
+incompatible torch version 
+2.5.1+cu121 for torchao 
+version 0.16.0             
+Please see https://github.com/
+pytorch/ao/issues/2919 for 
+more info
+At line:1 char:1
++ ..\.venv\Scripts\python -c 
+"from transformers.models.clip
+.modeling_cl ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~
+    + CategoryInfo          : 
+    NotSpecified: (Skipping   
+  import...9 for more info:   
+ String) [], RemoteExcepti    
+on
+    + FullyQualifiedErrorId : 
+    NativeCommandError
+ 
+Traceback (most recent call 
+last):
+  File "<string>", line 1, in 
+<module>
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\models\c
+lip\modeling_clip.py", line 
+25, in <module>
+    from ...modeling_layers 
+import 
+GradientCheckpointingLayer
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\modeling
+_layers.py", line 28, in 
+<module>
+    from .processing_utils 
+import Unpack
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\processi
+ng_utils.py", line 75, in 
+<module>
+    from .modeling_utils 
+import 
+PreTrainedAudioTokenizerBase
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\modeling
+_utils.py", line 73, in 
+<module>
+    from .quantizers import 
+HfQuantizer
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\quantize
+rs\__init__.py", line 14, in 
+<module>
+    from .auto import 
+AutoHfQuantizer, 
+AutoQuantizationConfig, 
+register_quantization_config, 
+register_quantizer
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\quantize
+rs\auto.py", line 62, in 
+<module>
+    from .quantizer_torchao 
+import TorchAoHfQuantizer
+  File "D:\cpc\.venv\Lib\site-
+packages\transformers\quantize
+rs\quantizer_torchao.py", 
+line 39, in <module>
+    import torchao
+  File "D:\cpc\.venv\Lib\site-
+packages\torchao\__init__.py",
+ line 135, in <module>
+    from torchao.quantization 
+import (
+  File "D:\cpc\.venv\Lib\site-
+packages\torchao\quantization\
+__init__.py", line 45, in 
+<module>
+    from 
+.linear_quant_modules import (
+  File "D:\cpc\.venv\Lib\site-
+packages\torchao\quantization\
+linear_quant_modules.py", 
+line 21, in <module>
+    from .quant_primitives 
+import (
+  File "D:\cpc\.venv\Lib\site-
+packages\torchao\quantization\
+quant_primitives.py", line 
+174, in <module>
+    torch.int1: (-(2**0), 
+2**0 - 1),
+    ^^^^^^^^^^
+  File "D:\cpc\.venv\Lib\site-
+packages\torch\__init__.py", 
+line 2562, in __getattr__
+    raise 
+AttributeError(f"module 
+'{__name__}' has no attribute 
+'{name}'")
+AttributeError: module 
+'torch' has no attribute 
+'int1'

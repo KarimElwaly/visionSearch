@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vision Search Agent</title>
+    <meta name="description" content="Security video search powered by YOLO + CLIP + Person Re-ID">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-content">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8" />
+                        <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg>
+                </div>
+                <h1>Vision Search <span class="accent">Agent</span></h1>
+            </div>
+            <div class="header-stats" id="headerStats">
+                <span class="stat-badge" id="videoCount">0 videos</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+        <!-- Search Section with Tabs -->
+        <section class="search-section">
+            <div class="search-container">
+                <!-- Tab Navigation -->
+                <div class="search-tabs">
+                    <button class="search-tab active" data-tab="text">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <circle cx="11" cy="11" r="8" />
+                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                        </svg>
+                        Text Search
+                    </button>
+                    <button class="search-tab" data-tab="image">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                            <circle cx="8.5" cy="8.5" r="1.5" />
+                            <polyline points="21 15 16 10 5 21" />
+                        </svg>
+                        Visual Search
+                    </button>
+                    <button class="search-tab person-tab" data-tab="person">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                            <circle cx="12" cy="7" r="4" />
+                        </svg>
+                        Find Person
+                    </button>
+                </div>
+
+                <!-- Tab Content: Text Search -->
+                <div class="tab-content active" id="tab-text">
+                    <div class="search-bar">
+                        <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8" />
+                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                        </svg>
+                        <input type="text" id="searchInput" placeholder="Describe what you're looking for..."
+                            autocomplete="off">
+                        <div class="search-controls">
+                            <select id="searchMode" class="mode-select">
+                                <option value="hybrid">Smart (2-Stage)</option>
+                                <option value="clip">CLIP Only</option>
+                            </select>
+                            <button id="searchBtn" class="search-btn">Search</button>
+                        </div>
+                    </div>
+                    <p class="search-hint">CLIP recall → YOLO-World re-ranking for precise results</p>
+                </div>
+
+                <!-- Tab Content: Visual Search -->
+                <div class="tab-content" id="tab-image">
+                    <div class="drop-zone" id="imageDropZone">
+                        <div class="drop-zone-content">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="1.5" opacity="0.4">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                                <circle cx="8.5" cy="8.5" r="1.5" />
+                                <polyline points="21 15 16 10 5 21" />
+                            </svg>
+                            <p class="drop-zone-title">Drop an image here</p>
+                            <p class="drop-zone-subtitle">or <span class="drop-zone-link">click to browse</span></p>
+                            <p class="drop-zone-hint">Finds visually similar frames across all indexed videos</p>
+                        </div>
+                        <input type="file" id="imageFileInput" accept="image/*" style="display:none">
+                    </div>
+                    <!-- Image preview -->
+                    <div class="image-preview" id="imagePreview" style="display:none;">
+                        <img id="previewImg" src="" alt="Search image">
+                        <span class="preview-label">Ready to search</span>
+                        <button class="preview-close" id="clearImage">&times;</button>
+                        <button id="imageSearchBtn" class="search-btn">Search</button>
+                    </div>
+                </div>
+
+                <!-- Tab Content: Find Person -->
+                <div class="tab-content" id="tab-person">
+                    <div class="drop-zone person-drop-zone" id="personDropZone">
+                        <div class="drop-zone-content">
+                            <div class="person-icon-circle">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="1.5">
+                                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                                    <circle cx="12" cy="7" r="4" />
+                                </svg>
+                            </div>
+                            <p class="drop-zone-title">Drop a person's photo here</p>
+                            <p class="drop-zone-subtitle">or <span class="drop-zone-link">click to browse</span></p>
+                            <div class="person-features">
+                                <span class="feature-tag">🚶 Body Matching</span>
+                                <span class="feature-tag">👤 Face Recognition</span>
+                                <span class="feature-tag">📹 Cross-Camera</span>
+                            </div>
+                        </div>
+                        <input type="file" id="personFileInput" accept="image/*" style="display:none">
+                    </div>
+                    <!-- Person preview -->
+                    <div class="image-preview person-preview" id="personPreview" style="display:none;">
+                        <img id="personPreviewImg" src="" alt="Person photo">
+                        <span class="preview-label">Person photo loaded</span>
+                        <button class="preview-close" id="clearPerson">&times;</button>
+                        <button id="personSearchBtn" class="search-btn person-search-btn">Find This Person</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Index Panel (collapsible) -->
+        <section class="index-section">
+            <button class="section-toggle" id="toggleIndex">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 5v14M5 12h14" />
+                </svg>
+                Index New Video
+                <svg class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2">
+                    <polyline points="6 9 12 15 18 9" />
+                </svg>
+            </button>
+            <div class="index-panel" id="indexPanel">
+                <div class="index-form">
+                    <input type="text" id="indexPath" placeholder="Enter video file or directory path..."
+                        class="path-input">
+                    <div class="index-options">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="useClip" checked>
+                            <span>CLIP + YOLO Indexing</span>
+                        </label>
+                        <button id="indexBtn" class="index-btn">Start Indexing</button>
+                    </div>
+                </div>
+                <!-- Progress bar -->
+                <div class="progress-section" id="progressSection" style="display:none;">
+                    <div class="progress-bar-track">
+                        <div class="progress-bar-fill" id="progressFill"></div>
+                    </div>
+                    <p class="progress-text" id="progressText">Preparing...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results -->
+        <section class="results-section" id="resultsSection" style="display:none;">
+            <div class="results-header">
+                <h2 id="resultsTitle">Results</h2>
+                <span class="results-count" id="resultsCount"></span>
+            </div>
+            <div class="results-grid" id="resultsGrid"></div>
+        </section>
+
+        <!-- Indexed Videos List -->
+        <section class="videos-section" id="videosSection">
+            <h2 class="section-title">Indexed Videos</h2>
+            <div class="videos-list" id="videosList">
+                <p class="empty-state">No videos indexed yet. Add a video path above to get started.</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- Image Modal -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal-content">
+            <button class="modal-close" id="modalClose">&times;</button>
+            <img id="modalImage" src="" alt="Full view">
+            <div class="modal-info" id="modalInfo"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

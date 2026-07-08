@@ -1,0 +1,247 @@
+# Vision Search Agent — Architecture & Workflow
+
+## High-Level Philosophy: "Index Fast, Search Smart"
+
+The system splits the work into two phases with fundamentally different strategies:
+
+| Phase | Strategy | Speed | AI Models Used |
+|-------|----------|-------|----------------|
+| **Indexing** | Dump *everything* into a vector database — fast and dumb | ~0.65 frames/s (CPU) | YOLO11n + CLIP ViT-L/14 |
+| **Searching** | Apply smart, multi-stage filtering at query time | ~1-3 seconds | CLIP + YOLO-World + VLM (optional) |
+
+---
+
+## System Components
+
+```mermaid
+graph TB
+    subgraph "Data Layer"
+        DB["SQLite DB<br/>(metadata + FTS5)"]
+        FAISS["FAISS Index<br/>(CLIP vectors)"]
+        DISK["Disk<br/>(frame & crop JPEGs)"]
+    end
+
+    subgraph "AI Models"
+        YOLO["YOLO11n<br/>(object detection)"]
+        CLIP["CLIP ViT-L/14<br/>(image↔text embeddings)"]
+        YW["YOLO-World<br/>(open-vocab detection)"]
+        VLM["Ollama VLM<br/>(image captioning)"]
+    end
+
+    subgraph "Core Modules"
+        IDX["indexer.py"]
+        SRCH["searcher.py"]
+        MDL["models.py"]
+    end
+
+    APP["app.py<br/>(FastAPI server)"]
+
+    APP --> IDX
+    APP --> SRCH
+    IDX --> MDL
+    SRCH --> MDL
+    MDL --> YOLO
+    MDL --> CLIP
+    SRCH --> YW
+    SRCH --> VLM
+    IDX --> DB
+    IDX --> FAISS
+    IDX --> DISK
+    SRCH --> DB
+    SRCH --> FAISS
+```
+
+---
+
+## Phase 1: Indexing Pipeline
+
+When you click "Index" on a video, this is what happens frame by frame:
+
+```mermaid
+flowchart TD
+    V["📹 Video File"] --> EXT["Extract Frames<br/>(seek at 1 FPS)"]
+    EXT --> HASH["Perceptual Hash<br/>(16×16 grayscale)"]
+    HASH -->|"Similar to prev?"| SKIP["⏭️ Skip frame"]
+    HASH -->|"New scene"| SAVE["💾 Save frame JPEG<br/>(background thread)"]
+    SAVE --> YOLO["🔍 YOLO11n Detection<br/>(find all objects)"]
+    YOLO --> CROP["✂️ Crop each object<br/>+ save JPEG"]
+    CROP --> BATCH["📦 Add to Mega-Batch<br/>(accumulate 32 frames)"]
+    BATCH -->|"Batch full"| CLIPENC["🧠 CLIP Encode ALL images<br/>(1 bulk call for 32 frames<br/>+ all their crops)"]
+    CLIPENC --> FAISS["📊 Add vectors to FAISS"]
+    FAISS --> DBINS["🗄️ Batch insert to SQLite<br/>(frames + detections + embeddings)"]
+    DBINS --> NEXT["Next frame..."]
+```
+
+### What Each Step Does
+
+#### 1. Frame Extraction ([extract_frames](file:///D:/cpc/vision_search/indexer.py#80-105))
+- Opens the video with OpenCV
+- **Seeks directly** to every Nth frame (e.g., at 30fps video with 1 FPS extraction, it jumps every 30 frames)
+- Yields [(frame_number, timestamp, frame_bgr)](file:///D:/cpc/vision_search/app.py#82-87)
+
+#### 2. Scene Change Detection ([_frame_hash](file:///D:/cpc/vision_search/indexer.py#48-53) + [_frames_similar](file:///D:/cpc/vision_search/indexer.py#55-60))
+- Resizes frame to tiny 16×16 grayscale → flattens to 256-element vector
+- Computes **cosine similarity** with previous frame's hash
+- If similarity > 0.92 → **skip** (nothing changed in the scene)
+- Saves ~5-10% of redundant frames on typical videos
+
+#### 3. YOLO11n Object Detection (`models.detect_objects`)
+- Runs YOLOv11-nano on the full frame
+- Detects all 80 COCO classes (people, cars, bags, phones, etc.) at confidence ≥ 0.3
+- Returns bounding boxes + class names + confidence scores
+- **Example output**: `[{class: "person", bbox: (100,200,300,500), conf: 0.92}, {class: "backpack", ...}]`
+
+#### 4. Crop & Save
+- Each detected object is cropped from the frame with 10% padding
+- Saved as individual JPEG files (e.g., `frame_000030_det_0.jpg`)
+- Disk writes happen in **background threads** (non-blocking)
+
+#### 5. CLIP Encoding (`models.encode_images_clip`)
+This is the **heart of the system**. CLIP (Contrastive Language-Image Pre-training) creates a **768-dimensional vector** for each image that lives in a shared embedding space with text.
+
+**Key insight**: If you encode the text "red bag" and an image of a red bag, their vectors will be **close together** (high cosine similarity).
+
+- Accumulates images across 32 frames into a **mega-batch**
+- One batch might contain: 32 full frames + ~100 crop images = ~132 images
+- All encoded in a single bulk CLIP call (much faster than 132 individual calls)
+- Each image → 768-dim normalized float32 vector
+
+#### 6. FAISS Index
+- Facebook AI Similarity Search — an in-memory vector index
+- Uses **Inner Product (IP)** similarity (equivalent to cosine similarity for normalized vectors)
+- Each CLIP vector gets a sequential FAISS ID
+- Stored to disk as `index.faiss`
+
+#### 7. SQLite Database
+Stores the metadata linking FAISS IDs back to actual files:
+
+```
+videos → frames → detections (with faiss_id, bbox, class_name)
+                → frame_embeddings (with faiss_id for full-frame vectors)
+```
+
+### What Gets Stored Per Frame
+
+For a single frame with 3 detected objects:
+
+| Item | FAISS Vector | SQLite Row | JPEG File |
+|------|-------------|------------|-----------|
+| Full frame | ✅ (768-dim) | [frame_embeddings](file:///D:/cpc/vision_search/database.py#198-204) | `frame_000030.jpg` |
+| Crop: person | ✅ (768-dim) | [detections](file:///D:/cpc/vision_search/database.py#206-215) | `frame_000030_det_0.jpg` |
+| Crop: backpack | ✅ (768-dim) | [detections](file:///D:/cpc/vision_search/database.py#206-215) | `frame_000030_det_1.jpg` |
+| Crop: car | ✅ (768-dim) | [detections](file:///D:/cpc/vision_search/database.py#206-215) | `frame_000030_det_2.jpg` |
+
+**Total CLIP vectors per frame**: 1 (frame) + N (objects) = typically 1-5 vectors
+
+---
+
+## Phase 2: Search Pipeline
+
+When you type a query like *"person wearing red jacket"*:
+
+```mermaid
+flowchart TD
+    Q["🔤 User Query:<br/>'person wearing red jacket'"] --> PARSE["Parse Query<br/>(negative prompts, attributes)"]
+    PARSE --> BLEND["Attribute Blending<br/>60% full query + 40% 'red'"]
+    BLEND --> CLIPT["🧠 CLIP Text Encode<br/>→ 768-dim query vector"]
+    CLIPT --> S1["⚡ Stage 1: FAISS Search<br/>Find top 100 nearest vectors<br/>(< 1ms)"]
+    S1 --> LOOKUP["🗄️ SQLite Lookup<br/>Map FAISS IDs → frame paths"]
+    LOOKUP --> S2["🔍 Stage 2: YOLO-World<br/>Re-rank top 20 candidates<br/>(~1-2 sec)"]
+    S2 --> TEMPORAL["📈 Temporal Boost<br/>Boost clustered frames,<br/>penalize isolated ones"]
+    TEMPORAL --> RESULTS["📋 Final Results<br/>(ranked by combined score)"]
+```
+
+### Stage 1: CLIP Vector Recall (instant, < 1ms)
+
+1. **Query Parsing**: Handles special syntax:
+   - `"red bag --no blue"` → subtracts "blue" vector from "red bag" vector
+   - `"red jacket"` → blends: 60% "red jacket" + 40% "red" (emphasizes color)
+
+2. **CLIP Text Encoding**: Converts query text → 768-dim vector (same space as image vectors)
+
+3. **FAISS Search**: Finds the top ~100 vectors closest to the query vector
+   - This searches ALL vectors — both full-frame AND individual crop vectors
+   - Sub-millisecond even with millions of vectors
+
+### Stage 2: YOLO-World Re-ranking (~1-2 seconds)
+
+YOLO-World is an **open-vocabulary** object detector. Unlike regular YOLO (fixed 80 classes), it can detect *anything* you describe in text.
+
+1. Sets the detection class to the user's exact query: `["person wearing red jacket"]`
+2. Runs YOLO-World on each of the top 20 candidate frames
+3. **Scoring**:
+   - If YOLO-World finds the object → **boost score** (+80% of detection confidence)
+   - If YOLO-World finds nothing → **heavy penalty** (score × 0.1)
+4. Re-sorts results by updated score
+
+**Why this matters**: CLIP might return frame #42 as top-1 because it vaguely looks like a jacket scene. But YOLO-World actually *looks for* a red jacket in that frame and confirms (or denies) its presence.
+
+### Stage 2.5: Temporal Continuity Boost
+
+Real objects persist across frames. If a result appears in a cluster of nearby timestamps (within 3 seconds), it gets a 20% boost. Isolated single-frame results get a 10% penalty.
+
+### (Optional) Stage 3: VLM Enrichment
+
+Not currently active during indexing, but can be used at search time to generate rich text descriptions using Ollama VLM.
+
+---
+
+## Why CLIP Encodes Both Frames AND Crops
+
+```
+ Search: "red backpack"
+ 
+ Full Frame CLIP Vector:                    Crop CLIP Vector:
+ ┌──────────────────────┐                   ┌──────────┐
+ │  🧑 person           │                   │ 🎒       │
+ │  🎒 red backpack     │  ← captures       │ red      │  ← captures
+ │  🚗 car in bg        │    everything      │ backpack │    ONLY the
+ │  🌳 trees            │    (noisy)         │          │    backpack
+ │  ☁️  sky              │                   └──────────┘    (precise)
+ └──────────────────────┘
+ 
+ CLIP similarity to "red backpack":
+   Full frame: 0.25 (weak - too much noise)
+   Crop:       0.78 (strong - exact match!)
+```
+
+**Full-frame vectors** capture the overall scene — good for queries like "outdoor parking lot" or "crowded room".
+
+**Crop vectors** capture individual objects — good for queries like "red backpack" or "person in white shirt".
+
+By indexing **both**, the system handles both types of queries well.
+
+---
+
+## File Structure
+
+```
+vision_search/
+├── app.py          → FastAPI server, routes, startup
+├── config.py       → All settings (models, paths, thresholds)
+├── models.py       → AI model loading & inference (CLIP, YOLO, VLM)
+├── indexer.py      → Video indexing pipeline
+├── searcher.py     → 3-stage search pipeline
+├── database.py     → SQLite schema & CRUD operations
+├── static/         → Web UI (HTML/CSS/JS)
+└── data/
+    ├── vision_search.db   → SQLite database
+    ├── index.faiss        → CLIP vector index
+    └── frames/
+        └── {video_id}/    → Extracted frame & crop JPEGs
+```
+
+---
+
+## Current Performance Bottleneck
+
+For your 1-minute video (0.65 frames/s on CPU):
+
+| Step | Time per Frame | % of Total |
+|------|---------------|------------|
+| CLIP encode (frame + ~3 crops) | **~1.2s** | **~78%** |
+| YOLO detection | ~0.2s | ~13% |
+| Frame extraction + hashing | ~0.1s | ~6% |
+| Disk I/O + DB | ~0.05s | ~3% |
+
+**CLIP encoding is the dominant bottleneck** — it processes the full frame PLUS every detected crop. Skipping CLIP on crops would cut encoding work by ~3-4x.
