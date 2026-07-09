@@ -7,18 +7,18 @@
 ## Architecture
 
 ```
-Video → Frame Extraction (1 FPS) → Scene-Change Filter → YOLO Detection → Crop Each Person/Object
-                                                                │
-                                          ┌─────────────────────┼──────────────────────┐
-                                          ▼                     ▼                      ▼
-                                   CLIP ViT-L/14         DINOv2 ViT-S14         FaceNet (VGGFace2)
-                                  (Vector Embeddings)    (Person Re-ID)         (Face Identity)
-                                          │                     │                      │
-                                          ▼                     ▼                      ▼
-                                    FAISS Index          Person FAISS Index      Face FAISS Index
-                                  (General Search)      (Body Matching)         (Face Matching)
+Video → Frame Extraction (Profile FPS) → YOLO Detection → IoU Tracking → Crop Each Person/Object
+                                                                      │
+                                                ┌─────────────────────┼──────────────────────┐
+                                                ▼                     ▼                      ▼
+                                         CLIP ViT-L/14         DINOv2 ViT-S14         FaceNet (VGGFace2)
+                                        (Vector Embeddings)    (Person Re-ID)         (Face Identity)
+                                                │                     │                      │
+                                                ▼                     ▼                      ▼
+                                          FAISS Index          Person FAISS Index      Face FAISS Index
+                                        (General Search)      (Body Matching)         (Face Matching)
 
-Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (Stage 2) ──► Temporal Boost (Stage 3)
+Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (Stage 2) ──► Filters / Track Grouping
                      <1ms                        ~1-2 seconds                       instant
 ```
 
@@ -29,6 +29,7 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 | **Text Search** | Natural language queries like "person in black jacket with bag" |
 | **Image Search** | Upload a photo to find visually similar frames/objects |
 | **Person Search** | Upload a person's photo to find them across all indexed videos (face + body) |
+| **Vehicle Search** | Upload a car/truck/bike photo to find matching vehicle tracks |
 
 ## Components
 
@@ -38,6 +39,7 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 | **Models** | `models.py` | CLIP encoding, YOLO detection, DINOv2 Re-ID, FaceNet identity, Ollama VLM |
 | **Database** | `database.py` | SQLite with FTS5 full-text search for metadata & captions |
 | **Indexer** | `indexer.py` | Video → frames → YOLO crops → CLIP/DINOv2/FaceNet embeddings (mega-batched) |
+| **Tracker** | `tracker.py` | Lightweight per-class IoU tracker for CCTV person/vehicle/object event grouping |
 | **Searcher** | `searcher.py` | 3-stage smart search: CLIP recall → YOLO-World re-rank → temporal boost |
 | **API Server** | `app.py` | FastAPI REST API + static file serving |
 | **Frontend** | `static/` | Dark-themed web UI with text, image, and person search tabs |
@@ -52,6 +54,7 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 - **Face Recognition**: FaceNet InceptionResnetV1 (512-dim identity matching)
 - **VLM Captioning**: Qwen3-VL 2B via Ollama (optional, for rich text descriptions)
 - **Vector Search**: FAISS (3 separate indexes: general, person, face)
+- **Tracking**: persistent IoU tracks (`tracks`, `track_detections`, `track_attributes`) for CCTV event grouping
 - **Text Search**: SQLite FTS5
 - **Backend**: FastAPI + Uvicorn
 - **Frontend**: Vanilla HTML/CSS/JS
@@ -116,6 +119,7 @@ Open **http://localhost:8420** in your browser.
   - `"red car"`, `"man walking"`, `"woman with glasses"`
 - Supports negative prompts: `"person in jacket --no hat"`
 - Search modes: **Hybrid** (default), **Text** only, **CLIP** only
+- Optional CCTV filters narrow long videos by video ID, camera ID, class, time range, and track grouping
 
 ### 3. Image Search
 - Switch to the **Image** tab
@@ -128,6 +132,11 @@ Open **http://localhost:8420** in your browser.
 - Uses dedicated biometric models (DINOv2 + FaceNet) for accurate identity matching
 - Finds the same person across different cameras, angles, and lighting
 
+### 5. Vehicle Search
+- Switch to the **Find Vehicle** tab
+- Upload a reference photo of a car, truck, bus, motorcycle, or bicycle
+- Results are filtered to vehicle classes and grouped by track by default
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
@@ -135,8 +144,14 @@ Open **http://localhost:8420** in your browser.
 | `GET` | `/api/search?q=...&top_k=20&mode=hybrid` | Text search indexed videos |
 | `POST` | `/api/search-by-image` | Image similarity search (multipart file upload) |
 | `POST` | `/api/search-by-person` | Person re-identification (multipart file upload) |
+| `POST` | `/api/search-by-vehicle` | Vehicle-focused image search, filtered to vehicle classes |
+| `GET` | `/api/videos/{id}/tracks` | List representative CCTV tracks for a video |
+| `GET` | `/api/tracks/{id}` | Ordered detection timeline for one track |
+| `GET` | `/api/tracks/{id}/export?format=json\|csv` | Export track evidence report |
+| `GET` | `/api/tracks/stats` | Aggregate track counts by class |
 | `POST` | `/api/index` | Start indexing (body: `{path, use_vlm, use_clip}`) |
 | `POST` | `/api/index/cancel` | Cooperatively stop the current indexing job (state → `paused`) |
+| `GET` | `/api/index/health` | Integrity check: DB vector refs vs FAISS counts and missing image files |
 | `GET` | `/api/status` | Get current indexing progress |
 | `GET` | `/api/health` | Lightweight readiness probe (no model calls) |
 | `GET` | `/api/videos` | List all indexed videos |
@@ -151,13 +166,17 @@ Open **http://localhost:8420** in your browser.
 Edit `config.py` to customize:
 
 ```python
-EXTRACT_FPS = 1                # Frames per second to extract
+INDEX_PROFILE = "investigation" # fast_preview | investigation | high_sensitivity
+EXTRACT_FPS = 1                # Derived from selected profile
 YOLO_CONFIDENCE = 0.3          # Detection confidence threshold
 YOLO_CLASSES = None            # None = all 80 COCO classes; [0] = person only
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 CLIP_MEGA_BATCH = 64           # Frames processed simultaneously (GPU batch size)
-PERSON_MATCH_THRESHOLD = 0.55  # DINOv2 cosine similarity threshold
+PERSON_MATCH_THRESHOLD = 0.72  # DINOv2 cosine similarity threshold
 FACE_MATCH_THRESHOLD = 0.50    # FaceNet cosine similarity threshold
+BODY_ONLY_DISCOUNT = 0.6       # Body-only results are possible clothing matches, not confirmed identity
+TRACK_IOU_THRESHOLD = 0.25     # Low-FPS-friendly IoU tracking threshold
+TRACK_MAX_MISSED = 5           # Sampled frames to keep an unmatched track alive
 FRAME_JPEG_QUALITY = 85        # On-disk frame quality (Phase 5)
 CROP_JPEG_QUALITY = 85         # On-disk detection-crop quality
 FACE_JPEG_QUALITY = 90         # On-disk face-crop quality (higher = preserve identity cues)
@@ -190,6 +209,10 @@ Designed to handle **multi-hour videos** and large corpora without falling over:
 - **SQLite indexes** — covering indexes on `frames(video_id)`, `detections(faiss_id | person_faiss_id | frame_id)`,
   `faces(face_faiss_id | detection_id)`, `frame_embeddings(faiss_id)`, plus a unique constraint on
   `frames(video_id, frame_number)`. `PRAGMA journal_mode=WAL / synchronous=NORMAL / temp_store=MEMORY`.
+- **CCTV tracking schema** — `tracks` stores event start/end time, best detection, detection count, and class;
+  `track_detections` links every YOLO crop back to its track for timeline/evidence browsing.
+- **Index integrity check** — `/api/index/health` compares DB vector references with FAISS sidecar counts and reports
+  missing frame/crop files before long investigations rely on the archive.
 
 ## Search Quality
 
@@ -208,6 +231,8 @@ Designed to handle **multi-hour videos** and large corpora without falling over:
   get −10 % (real objects persist, glitches don't).
 - **Near-duplicate clustering** — result cards from the same video within ±2 frames are collapsed into
   a single card with a `+N` badge showing sibling count.
+- **Track-aware search** — all search APIs accept filters (`video_id`, `camera_id`, `class_name`, `start_time`,
+  `end_time`, `min_score`, `match_type`) and `group_tracks=true` to collapse repeated hits into one track/event card.
 
 ## Performance
 

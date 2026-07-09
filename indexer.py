@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import config
 import database as db
 import models
+import tracker as tracking
 
 
 # Global indexing state
@@ -285,7 +286,7 @@ def crop_detection(frame_bgr: np.ndarray, bbox: tuple, pad_ratio: float = 0.1) -
     return Image.fromarray(crop)
 
 
-def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index, 
+def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
                       use_clip, video_id, io_executor, video_frames_dir):
     """Process a mega-batch: bulk CLIP encode + batch DB inserts.
     
@@ -382,6 +383,25 @@ def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_in
     if person_updates:
         db.batch_update_person_faiss_ids(person_updates)
 
+    # --- 5b. Persist CCTV track assignments for each detection ---
+    track_observations = []
+    for mb in mega_batch:
+        for rec in mb["crop_records"]:
+            if rec.get("detection_id") is None or rec.get("track_local_id") is None:
+                continue
+            track_observations.append({
+                "local_track_id": rec["track_local_id"],
+                "class_name": rec["class_name"],
+                "frame_id": mb["frame_id"],
+                "detection_id": rec["detection_id"],
+                "frame_number": mb["frame_no"],
+                "timestamp": mb["timestamp"],
+                "confidence": rec["confidence"],
+                "bbox": rec["bbox"],
+            })
+    if track_observations:
+        db.batch_link_track_detections(video_id, track_observations)
+
     # --- 6. Batch Face detection + FaceNet encode for person crops ---
     person_regions = []
     person_meta = []  # (bi, ci, px1, py1, px2, py2, det_id, frame_id, frame_no)
@@ -454,7 +474,9 @@ def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_in
                     db.batch_add_faces(face_rows)
 
 
-def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True):
+def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True,
+                camera_id: str = None, location: str = None, recording_start_time: str = None,
+                timezone: str = None, index_profile: str = None):
     """Public entry: index one video with crash-safe error handling.
 
     On any unhandled exception we mark the video as ``failed`` (with the
@@ -466,7 +488,16 @@ def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True):
     _pre_video_path = os.path.abspath(video_path)
     _existing = db.get_video_by_path(_pre_video_path)
     try:
-        return _index_video_impl(video_path, use_vlm=use_vlm, use_clip=use_clip)
+        return _index_video_impl(
+            video_path,
+            use_vlm=use_vlm,
+            use_clip=use_clip,
+            camera_id=camera_id,
+            location=location,
+            recording_start_time=recording_start_time,
+            timezone=timezone,
+            index_profile=index_profile,
+        )
     except IndexingCancelled:
         # Not an error path \u2014 request_cancel() sets status via the impl.
         raise
@@ -487,7 +518,9 @@ def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True):
         return
 
 
-def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = True):
+def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = True,
+                      camera_id: str = None, location: str = None, recording_start_time: str = None,
+                      timezone: str = None, index_profile: str = None):
     """
     Index a video FAST \u2014 CLIP embeddings + YOLO crops only.
 
@@ -513,15 +546,42 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     duration = total_frames_raw / video_fps if video_fps > 0 else 0
     cap.release()
 
-    # Estimate how many frames we'll actually process (before scene-change filtering)
-    frame_interval = max(1, int(video_fps / config.EXTRACT_FPS))
+    active_profile = index_profile or config.INDEX_PROFILE
+    if active_profile not in config.INDEX_PROFILES:
+        print(f"[indexer] unknown index profile '{active_profile}', using investigation")
+        active_profile = "investigation"
+    profile_cfg = config.get_index_profile(active_profile)
+    extract_fps = float(profile_cfg["extract_fps"])
+    scene_skip_enabled = bool(profile_cfg["scene_skip_enabled"])
+
+    # Estimate how many frames we'll actually process (before optional scene-change filtering)
+    frame_interval = max(1, int(video_fps / extract_fps))
     estimated_frames = total_frames_raw // frame_interval if frame_interval > 0 else total_frames_raw
 
     if existing:
         video_id = existing["id"]
         db.update_video_status(video_id, "indexing")
+        db.update_video_metadata(
+            video_id,
+            camera_id=camera_id,
+            location=location,
+            recording_start_time=recording_start_time,
+            timezone=timezone,
+            index_profile=active_profile,
+        )
     else:
-        video_id = db.add_video(filename, video_path, duration, video_fps, total_frames_raw)
+        video_id = db.add_video(
+            filename,
+            video_path,
+            duration,
+            video_fps,
+            total_frames_raw,
+            camera_id=camera_id,
+            location=location,
+            recording_start_time=recording_start_time,
+            timezone=timezone,
+            index_profile=active_profile,
+        )
 
     # Resume from last checkpoint if this video was partially indexed. Use the max frame
     # already stored in DB as the ground truth (survives crashes better than the counter).
@@ -553,7 +613,8 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     print(f"[indexer]   Video duration : {_fmt_time(duration)}")
     print(f"[indexer]   Video FPS      : {video_fps:.1f}")
     print(f"[indexer]   Total frames   : {total_frames_raw:,}")
-    print(f"[indexer]   Extract at     : {config.EXTRACT_FPS} FPS (1 frame every {frame_interval} frames)")
+    print(f"[indexer]   Extract at     : {extract_fps} FPS (1 frame every {frame_interval} frames)")
+    print(f"[indexer]   Index profile  : {active_profile} (scene skip: {'on' if scene_skip_enabled else 'off'})")
     print(f"[indexer]   Est. frames    : ~{estimated_frames:,}")
     print(f"[indexer]   Mega-batch size: {config.CLIP_MEGA_BATCH}")
     print(f"{'='*60}")
@@ -574,6 +635,12 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     skipped = 0
     processed = resume_processed
     total_detections = 0
+    track_start_id = db.get_next_track_local_id(video_id)
+    object_tracker = tracking.SimpleIOUTracker(
+        iou_threshold=config.TRACK_IOU_THRESHOLD,
+        max_missed=config.TRACK_MAX_MISSED,
+        start_local_id=track_start_id,
+    )
     batches_since_checkpoint = 0
     cancelled = False
     t_start = time.time()
@@ -586,7 +653,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
     def _extractor():
         try:
-            for fno, ts, fb in extract_frames(video_path, start_frame=resume_from):
+            for fno, ts, fb in extract_frames(video_path, fps=extract_fps, start_frame=resume_from):
                 frame_queue.put((fno, ts, fb))
         except Exception as exc:
             extractor_error.append(exc)
@@ -609,12 +676,15 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
         frame_no, timestamp, frame_bgr = data
 
-        # Scene change detection
-        curr_hash = _frame_hash(frame_bgr)
-        if _frames_similar(prev_hash, curr_hash):
-            skipped += 1
-            continue
-        prev_hash = curr_hash
+        # Scene change detection. Disabled by default in CCTV investigation mode:
+        # a static background can hide a small moving person/object from the
+        # global 16x16 hash and cause missed evidence.
+        if scene_skip_enabled:
+            curr_hash = _frame_hash(frame_bgr)
+            if _frames_similar(prev_hash, curr_hash):
+                skipped += 1
+                continue
+            prev_hash = curr_hash
 
         # Save frame to disk (non-blocking)
         frame_path = os.path.join(video_frames_dir, f"frame_{frame_no:06d}.jpg")
@@ -641,7 +711,9 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
             for mb, dets in zip(mega_batch, batch_dets):
                 mb["detections"] = dets
                 total_detections += len(dets)
+                track_assignments = object_tracker.update(mb["frame_no"], mb["timestamp"], dets)
                 for di, det in enumerate(dets):
+                    track_assignment = track_assignments[di] if di < len(track_assignments) else {}
                     crop_img = crop_detection(mb["frame_bgr_ref"], det["bbox"])
                     crop_filename = f"frame_{mb['frame_no']:06d}_det_{di}.jpg"
                     crop_path = os.path.join(video_frames_dir, crop_filename)
@@ -652,6 +724,9 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
                         "confidence": det["confidence"],
                         "bbox": det["bbox"],
                         "crop_path": crop_path,
+                        "track_local_id": track_assignment.get("track_local_id"),
+                        "track_iou": track_assignment.get("track_iou"),
+                        "track_is_new": track_assignment.get("track_is_new", False),
                     })
 
             _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
@@ -700,7 +775,9 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
         for mb, dets in zip(mega_batch, batch_dets):
             mb["detections"] = dets
             total_detections += len(dets)
+            track_assignments = object_tracker.update(mb["frame_no"], mb["timestamp"], dets)
             for di, det in enumerate(dets):
+                track_assignment = track_assignments[di] if di < len(track_assignments) else {}
                 crop_img = crop_detection(mb["frame_bgr_ref"], det["bbox"])
                 crop_filename = f"frame_{mb['frame_no']:06d}_det_{di}.jpg"
                 crop_path = os.path.join(video_frames_dir, crop_filename)
@@ -711,6 +788,9 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
                     "confidence": det["confidence"],
                     "bbox": det["bbox"],
                     "crop_path": crop_path,
+                    "track_local_id": track_assignment.get("track_local_id"),
+                    "track_iou": track_assignment.get("track_iou"),
+                    "track_is_new": track_assignment.get("track_is_new", False),
                 })
                 
         _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
@@ -758,6 +838,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
     person_count = person_faiss_index.ntotal if person_faiss_index else 0
     face_count = face_faiss_index.ntotal if face_faiss_index else 0
+    track_stats = db.get_track_stats(video_id)
 
     print(f"\n{'='*60}")
     print(f"[indexer] DONE: {filename}")
@@ -767,6 +848,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     print(f"[indexer]   Frames indexed    : {processed:,}")
     print(f"[indexer]   Frames skipped    : {skipped:,} (scene duplicates)")
     print(f"[indexer]   Objects detected  : {total_detections:,}")
+    print(f"[indexer]   Tracks created    : {track_stats['tracks']:,}")
     print(f"[indexer]   Person vectors    : {person_count:,} (Re-ID index)")
     print(f"[indexer]   Face vectors      : {face_count:,} (Face index)")
     print(f"[indexer]   Avg speed         : {fps_final:.2f} frames/s")
@@ -786,17 +868,28 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     })
 
 
-def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True):
+def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
+                    camera_id: str = None, location: str = None, recording_start_time: str = None,
+                    timezone: str = None, index_profile: str = None):
     """Recursively index all video files in a directory."""
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"}
     videos = [os.path.join(r, f) for r, _, fs in os.walk(dir_path)
               for f in fs if os.path.splitext(f)[1].lower() in exts]
     for i, vp in enumerate(videos):
         indexing_status["message"] = f"Video {i + 1}/{len(videos)}: {os.path.basename(vp)}"
-        index_video(vp, use_vlm=use_vlm, use_clip=use_clip)
+        index_video(
+            vp,
+            use_vlm=use_vlm,
+            use_clip=use_clip,
+            camera_id=camera_id,
+            location=location,
+            recording_start_time=recording_start_time,
+            timezone=timezone,
+            index_profile=index_profile,
+        )
 
 
-def _remove_ids_from_index(path: str, ids: list, dim: int) -> int:
+def _remove_ids_from_index(path: str, ids: list, dim: int, use_flat: bool = False) -> int:
     """Remove FAISS ids from the index at ``path``. Returns removed count.
 
     HNSW does not implement ``remove_ids`` natively; when that raises RuntimeError
@@ -805,7 +898,7 @@ def _remove_ids_from_index(path: str, ids: list, dim: int) -> int:
     """
     if not ids or not os.path.exists(path):
         return 0
-    index = _load_or_create_index(path, dim)
+    index = _load_or_create_index(path, dim, use_flat=use_flat)
     id_set = set(int(i) for i in ids)
     try:
         arr = np.asarray(list(id_set), dtype=np.int64)
@@ -827,7 +920,7 @@ def _remove_ids_from_index(path: str, ids: list, dim: int) -> int:
     if len(survivors_ids) == total_before:
         return 0
 
-    new_index = _make_index(dim)
+    new_index = _make_flat_index(dim) if use_flat else _make_index(dim)
     if survivors_ids:
         vecs = np.vstack([index.reconstruct(int(i)) for i in survivors_ids]).astype("float32")
         new_index.add_with_ids(vecs, np.asarray(survivors_ids, dtype=np.int64))
@@ -847,8 +940,8 @@ def delete_video_fully(video_id: int) -> dict:
     ids = db.get_faiss_ids_for_video(video_id)
 
     removed_general = _remove_ids_from_index(config.FAISS_INDEX_PATH, ids["general"], config.CLIP_DIM)
-    removed_person = _remove_ids_from_index(config.PERSON_FAISS_INDEX_PATH, ids["person"], config.REID_DIM)
-    removed_face = _remove_ids_from_index(config.FACE_FAISS_INDEX_PATH, ids["face"], config.FACE_REC_DIM)
+    removed_person = _remove_ids_from_index(config.PERSON_FAISS_INDEX_PATH, ids["person"], config.REID_DIM, use_flat=True)
+    removed_face = _remove_ids_from_index(config.FACE_FAISS_INDEX_PATH, ids["face"], config.FACE_REC_DIM, use_flat=True)
 
     # ON DELETE CASCADE in schema removes frames \u2192 detections \u2192 faces \u2192 frame_embeddings.
     db.delete_video(video_id)

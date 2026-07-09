@@ -230,7 +230,7 @@ def detect_faces(frame_bgr: np.ndarray) -> list:
     if model is None:
         return []
     try:
-        results = model(frame_bgr, conf=0.4, half=True, verbose=False)
+        results = model(frame_bgr, conf=config.FACE_DETECTION_CONFIDENCE, half=True, verbose=False)
         faces = []
         for r in results:
             for box in r.boxes:
@@ -252,7 +252,7 @@ def detect_faces_batch(frames_bgr: list) -> list:
     model = _load_yolo_face()
     if model is None or not frames_bgr: return [[] for _ in frames_bgr]
     try:
-        results = model(frames_bgr, conf=0.4, half=True, verbose=False, stream=True)
+        results = model(frames_bgr, conf=config.FACE_DETECTION_CONFIDENCE, half=True, verbose=False, stream=True)
         batch_faces = []
         for r in results:
             faces = []

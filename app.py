@@ -1,10 +1,13 @@
 """FastAPI server for Vision-Search Agent."""
 import os
 import asyncio
+import csv
+import json
+from io import StringIO
 from threading import Thread
 from fastapi import FastAPI, BackgroundTasks, Query, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from PIL import Image
 import io
@@ -45,6 +48,131 @@ class IndexRequest(BaseModel):
     path: str
     use_vlm: bool = True
     use_clip: bool = True
+    camera_id: str | None = None
+    location: str | None = None
+    recording_start_time: str | None = None
+    timezone: str | None = None
+    index_profile: str | None = None
+
+
+def _expanded_top_k(top_k: int, *filters) -> int:
+    """Fetch more candidates when applying post-search CCTV filters/grouping."""
+    return max(top_k * 5, 100) if any(v is not None and v is not False for v in filters) else top_k
+
+
+def _filter_results(results: list, video_id: int = None, camera_id: str = None,
+                    class_name: str = None, start_time: float = None, end_time: float = None,
+                    min_score: float = None, match_type: str = None) -> list:
+    """Apply CCTV filters to already-ranked search results."""
+    filtered = []
+    camera_norm = camera_id.lower() if camera_id else None
+    class_norm = class_name.lower() if class_name else None
+    match_norm = match_type.lower() if match_type else None
+    for r in results:
+        if video_id is not None and int(r.get("video_id") or -1) != int(video_id):
+            continue
+        if camera_norm and str(r.get("camera_id") or "").lower() != camera_norm:
+            continue
+        if class_norm and str(r.get("class_name") or "").lower() != class_norm:
+            continue
+        ts = float(r.get("timestamp") or 0)
+        if start_time is not None and ts < float(start_time):
+            continue
+        if end_time is not None and ts > float(end_time):
+            continue
+        if min_score is not None and float(r.get("score") or 0) < float(min_score):
+            continue
+        if match_norm and str(r.get("match_type") or "").lower() != match_norm:
+            continue
+        filtered.append(r)
+    return filtered
+
+
+def _group_results_by_track(results: list) -> list:
+    """Collapse multiple candidate detections from the same track into one event card."""
+    grouped = {}
+    untracked = []
+    for r in sorted(results, key=lambda item: item.get("score", 0), reverse=True):
+        track_id = r.get("track_id")
+        if not track_id:
+            untracked.append(r)
+            continue
+        key = int(track_id)
+        if key not in grouped:
+            item = dict(r)
+            item["type"] = "track"
+            item["source"] = f"{item.get('source', 'search')}+track"
+            item["track_result"] = True
+            item["detection_count"] = 1
+            item["track_start_timestamp"] = float(item.get("timestamp") or 0)
+            item["track_end_timestamp"] = float(item.get("timestamp") or 0)
+            grouped[key] = item
+        else:
+            item = grouped[key]
+            item["detection_count"] += 1
+            ts = float(r.get("timestamp") or 0)
+            item["track_start_timestamp"] = min(item["track_start_timestamp"], ts)
+            item["track_end_timestamp"] = max(item["track_end_timestamp"], ts)
+            item.setdefault("_cluster", []).append(r)
+
+    merged = list(grouped.values()) + untracked
+    merged.sort(key=lambda item: item.get("score", 0), reverse=True)
+    return merged
+
+
+def _faiss_count_from_meta(index_path: str) -> dict:
+    """Read FAISS count from sidecar when possible; fall back to faiss.read_index."""
+    meta_path = index_path + ".meta.json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            return {"exists": os.path.exists(index_path), "count": int(meta.get("count", 0)), "source": "meta"}
+        except Exception as exc:
+            return {"exists": os.path.exists(index_path), "count": None, "source": "meta", "error": str(exc)}
+    if not os.path.exists(index_path):
+        return {"exists": False, "count": 0, "source": "missing"}
+    try:
+        import faiss
+        idx = faiss.read_index(index_path)
+        return {"exists": True, "count": int(idx.ntotal), "source": "faiss"}
+    except Exception as exc:
+        return {"exists": True, "count": None, "source": "faiss", "error": str(exc)}
+
+
+def _index_health_report() -> dict:
+    """Compare DB vector references, FAISS counts, and stored image files."""
+    with db.get_db() as conn:
+        general_db = conn.execute(
+            """SELECT
+                   (SELECT COUNT(*) FROM detections WHERE faiss_id IS NOT NULL) +
+                   (SELECT COUNT(*) FROM frame_embeddings WHERE faiss_id IS NOT NULL) AS n"""
+        ).fetchone()["n"]
+        person_db = conn.execute("SELECT COUNT(*) AS n FROM detections WHERE person_faiss_id IS NOT NULL").fetchone()["n"]
+        face_db = conn.execute("SELECT COUNT(*) AS n FROM faces WHERE face_faiss_id IS NOT NULL").fetchone()["n"]
+        frame_paths = [r["frame_path"] for r in conn.execute("SELECT frame_path FROM frames")]
+        crop_paths = [r["crop_path"] for r in conn.execute("SELECT crop_path FROM detections WHERE crop_path IS NOT NULL")]
+        face_paths = [r["crop_path"] for r in conn.execute("SELECT crop_path FROM faces WHERE crop_path IS NOT NULL")]
+
+    indexes = {
+        "general": {"db_refs": int(general_db), **_faiss_count_from_meta(config.FAISS_INDEX_PATH)},
+        "person": {"db_refs": int(person_db), **_faiss_count_from_meta(config.PERSON_FAISS_INDEX_PATH)},
+        "face": {"db_refs": int(face_db), **_faiss_count_from_meta(config.FACE_FAISS_INDEX_PATH)},
+    }
+    for item in indexes.values():
+        item["matches"] = item.get("count") == item.get("db_refs") if item.get("count") is not None else False
+
+    all_paths = frame_paths + crop_paths + face_paths
+    missing = [p for p in all_paths if p and not os.path.exists(p)]
+    return {
+        "ok": all(item["matches"] for item in indexes.values()) and not missing,
+        "indexes": indexes,
+        "files": {
+            "checked": len(all_paths),
+            "missing": len(missing),
+            "missing_samples": missing[:20],
+        },
+    }
 
 
 # ---- API Endpoints ----
@@ -54,9 +182,24 @@ async def api_search(
     q: str = Query(..., description="Search query"),
     top_k: int = Query(20, description="Number of results"),
     mode: str = Query("hybrid", description="Search mode: text, clip, or hybrid"),
+    video_id: int | None = Query(None),
+    camera_id: str | None = Query(None),
+    class_name: str | None = Query(None),
+    start_time: float | None = Query(None, description="Video-relative start time in seconds"),
+    end_time: float | None = Query(None, description="Video-relative end time in seconds"),
+    min_score: float | None = Query(None),
+    match_type: str | None = Query(None),
+    group_tracks: bool = Query(False, description="Collapse detections by track_id"),
 ):
     """Search indexed videos by natural language query."""
-    results = searcher.search(q, top_k=top_k, mode=mode)
+    search_top_k = _expanded_top_k(
+        top_k, video_id, camera_id, class_name, start_time, end_time, min_score, match_type, group_tracks
+    )
+    results = searcher.search(q, top_k=search_top_k, mode=mode)
+    results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score, match_type)
+    if group_tracks:
+        results = _group_results_by_track(results)
+    results = results[:top_k]
     return {"query": q, "mode": mode, "count": len(results), "results": results}
 
 
@@ -64,24 +207,74 @@ async def api_search(
 async def api_search_by_image(
     file: UploadFile = File(...),
     top_k: int = Query(20),
+    video_id: int | None = Query(None),
+    camera_id: str | None = Query(None),
+    class_name: str | None = Query(None),
+    start_time: float | None = Query(None),
+    end_time: float | None = Query(None),
+    min_score: float | None = Query(None),
+    group_tracks: bool = Query(False),
 ):
     """Search by uploading an image — finds visually similar frames."""
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
-    results = searcher.search_by_image(image, top_k=top_k)
+    search_top_k = _expanded_top_k(top_k, video_id, camera_id, class_name, start_time, end_time, min_score, group_tracks)
+    results = searcher.search_by_image(image, top_k=search_top_k)
+    results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score)
+    if group_tracks:
+        results = _group_results_by_track(results)
+    results = results[:top_k]
     return {"query": f"[image: {file.filename}]", "mode": "image", "count": len(results), "results": results}
+
+
+@app.post("/api/search-by-vehicle")
+async def api_search_by_vehicle(
+    file: UploadFile = File(...),
+    top_k: int = Query(20),
+    video_id: int | None = Query(None),
+    camera_id: str | None = Query(None),
+    class_name: str | None = Query(None),
+    start_time: float | None = Query(None),
+    end_time: float | None = Query(None),
+    min_score: float | None = Query(None),
+    group_tracks: bool = Query(True),
+):
+    """Vehicle-focused image search for cars/trucks/bikes in CCTV footage."""
+    contents = await file.read()
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    search_top_k = _expanded_top_k(top_k, video_id, camera_id, class_name, start_time, end_time, min_score, group_tracks)
+    results = searcher.search_by_image(image, top_k=max(search_top_k, 100))
+    vehicle_classes = {c.lower() for c in config.VEHICLE_CLASSES}
+    results = [r for r in results if str(r.get("class_name") or "").lower() in vehicle_classes]
+    results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score)
+    if group_tracks:
+        results = _group_results_by_track(results)
+    results = results[:top_k]
+    return {"query": f"[vehicle: {file.filename}]", "mode": "vehicle", "count": len(results), "results": results}
 
 
 @app.post("/api/search-by-person")
 async def api_search_by_person(
     file: UploadFile = File(...),
     top_k: int = Query(20),
+    video_id: int | None = Query(None),
+    camera_id: str | None = Query(None),
+    start_time: float | None = Query(None),
+    end_time: float | None = Query(None),
+    min_score: float | None = Query(None),
+    match_type: str | None = Query(None),
+    group_tracks: bool = Query(False),
 ):
     """Search by person photo — find this specific person across all indexed videos.
     Uses dedicated person Re-ID and face recognition FAISS indexes."""
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
-    results = searcher.search_by_person(image, top_k=top_k)
+    search_top_k = _expanded_top_k(top_k, video_id, camera_id, start_time, end_time, min_score, match_type, group_tracks)
+    results = searcher.search_by_person(image, top_k=search_top_k)
+    results = _filter_results(results, video_id, camera_id, "person", start_time, end_time, min_score, match_type)
+    if group_tracks:
+        results = _group_results_by_track(results)
+    results = results[:top_k]
     return {"query": f"[person: {file.filename}]", "mode": "person", "count": len(results), "results": results}
 
 
@@ -97,9 +290,27 @@ async def api_index(req: IndexRequest, background_tasks: BackgroundTasks):
     
     def _run():
         if os.path.isdir(path):
-            indexer.index_directory(path, use_vlm=req.use_vlm, use_clip=req.use_clip)
+            indexer.index_directory(
+                path,
+                use_vlm=req.use_vlm,
+                use_clip=req.use_clip,
+                camera_id=req.camera_id,
+                location=req.location,
+                recording_start_time=req.recording_start_time,
+                timezone=req.timezone,
+                index_profile=req.index_profile,
+            )
         else:
-            indexer.index_video(path, use_vlm=req.use_vlm, use_clip=req.use_clip)
+            indexer.index_video(
+                path,
+                use_vlm=req.use_vlm,
+                use_clip=req.use_clip,
+                camera_id=req.camera_id,
+                location=req.location,
+                recording_start_time=req.recording_start_time,
+                timezone=req.timezone,
+                index_profile=req.index_profile,
+            )
     
     thread = Thread(target=_run, daemon=True)
     thread.start()
@@ -146,7 +357,16 @@ async def api_reindex_video(video_id: int):
     stats = indexer.delete_video_fully(video_id)
 
     def _run():
-        indexer.index_video(source_path, use_vlm=False, use_clip=True)
+        indexer.index_video(
+            source_path,
+            use_vlm=False,
+            use_clip=True,
+            camera_id=row["camera_id"] if "camera_id" in row.keys() else None,
+            location=row["location"] if "location" in row.keys() else None,
+            recording_start_time=row["recording_start_time"] if "recording_start_time" in row.keys() else None,
+            timezone=row["timezone"] if "timezone" in row.keys() else None,
+            index_profile=row["index_profile"] if "index_profile" in row.keys() else None,
+        )
 
     Thread(target=_run, daemon=True).start()
     return {"message": f"Reindexing started: {source_path}", "purged": stats}
@@ -180,10 +400,77 @@ async def api_health():
     }
 
 
+@app.get("/api/index/health")
+async def api_index_health():
+    """Integrity check: DB vector references vs FAISS counts and missing stored images."""
+    return _index_health_report()
+
+
 @app.get("/api/storage")
 async def api_storage():
     """Per-video row counts (used by the frontend for storage/stats views)."""
     return db.get_storage_stats()
+
+
+@app.get("/api/tracks/stats")
+async def api_track_stats(video_id: int | None = Query(None)):
+    """Aggregate CCTV track counts, optionally for one video."""
+    return db.get_track_stats(video_id)
+
+
+@app.get("/api/videos/{video_id}/tracks")
+async def api_video_tracks(
+    video_id: int,
+    class_name: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """List representative object/person tracks for a video."""
+    with db.get_db() as conn:
+        video = conn.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+    if video is None:
+        return JSONResponse(status_code=404, content={"error": "Video not found"})
+    rows = db.get_tracks_for_video(video_id, class_name=class_name, limit=limit)
+    tracks = []
+    for row in rows:
+        item = dict(row)
+        item["duration"] = max(0, float(item.get("end_timestamp") or 0) - float(item.get("start_timestamp") or 0))
+        tracks.append(item)
+    return {"video": dict(video), "count": len(tracks), "tracks": tracks}
+
+
+@app.get("/api/tracks/{track_id}")
+async def api_track_timeline(track_id: int, limit: int = Query(500, ge=1, le=2000)):
+    """Return ordered detections for one CCTV track."""
+    rows = db.get_track_timeline(track_id, limit=limit)
+    if not rows:
+        return JSONResponse(status_code=404, content={"error": "Track not found"})
+    return {"track_id": track_id, "count": len(rows), "timeline": [dict(r) for r in rows]}
+
+
+@app.get("/api/tracks/{track_id}/export")
+async def api_track_export(track_id: int, format: str = Query("json", pattern="^(json|csv)$")):
+    """Export a track timeline as JSON or CSV evidence report."""
+    rows = [dict(r) for r in db.get_track_timeline(track_id, limit=5000)]
+    if not rows:
+        return JSONResponse(status_code=404, content={"error": "Track not found"})
+    if format == "csv":
+        fields = [
+            "track_id", "detection_id", "frame_number", "timestamp", "confidence",
+            "class_name", "video_filename", "video_path", "frame_path", "crop_path",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+        ]
+        buf = StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            row["track_id"] = track_id
+            writer.writerow(row)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=track_{track_id}_evidence.csv"},
+        )
+    return {"track_id": track_id, "count": len(rows), "timeline": rows}
 
 
 def _is_safe_frame_path(path: str) -> bool:

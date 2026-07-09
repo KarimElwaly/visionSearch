@@ -111,7 +111,7 @@ def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
                 continue
 
             # Search with stricter confidence threshold (0.15 instead of 0.10)
-            results = model(frame, conf=0.15, verbose=False)
+            results = model(frame, conf=config.YOLO_WORLD_CONFIDENCE, verbose=False)
             
             # Count detections and get max confidence
             max_conf = 0.0
@@ -300,8 +300,13 @@ def search(query: str, top_k: int = None, mode: str = "hybrid"):
             # Generate the advanced query embedding (combines blending + negative prompts)
             query_emb = _get_query_embedding(query)
             
-            # Get more candidates than needed — Stage 2 will filter
-            n_candidates = min(top_k * 5, index.ntotal)
+            # Get more candidates than needed — long CCTV videos can contain
+            # tens of thousands of near-similar detections, so keep recall high
+            # before YOLO-World and temporal de-duplication filter the list.
+            n_candidates = min(
+                max(top_k * config.CLIP_CANDIDATE_POOL_FACTOR, config.CLIP_MIN_CANDIDATES),
+                index.ntotal,
+            )
             scores, indices = index.search(query_emb, n_candidates)
 
             valid = [(int(indices[0][i]), float(scores[0][i]))
@@ -460,7 +465,7 @@ def search_by_image(image: Image.Image, top_k: int = None):
         # Convert PIL to CV2 format for YOLO
         cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         yolo_model = _load_image_search_yolo()
-        yolo_results = yolo_model(cv_img, conf=0.2, verbose=False)
+        yolo_results = yolo_model(cv_img, conf=config.IMAGE_SEARCH_YOLO_CONFIDENCE, verbose=False)
         
         max_area = 0
         
@@ -480,7 +485,10 @@ def search_by_image(image: Image.Image, top_k: int = None):
             print("[search] No clear object found, using full image.")
             query_emb = models.encode_images_clip([image])
 
-        n_candidates = min(top_k * 3, index.ntotal)
+        n_candidates = min(
+            max(top_k * config.IMAGE_CANDIDATE_POOL_FACTOR, config.IMAGE_MIN_CANDIDATES),
+            index.ntotal,
+        )
         scores, indices = index.search(query_emb, n_candidates)
 
         valid = [(int(indices[0][i]), float(scores[0][i]))
@@ -585,7 +593,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
     if os.path.exists(person_index_path) and query_emb is not None:
         person_index = faiss.read_index(person_index_path)
         if person_index.ntotal > 0:
-            n_candidates = min(top_k * 3, person_index.ntotal)
+            n_candidates = min(
+                max(top_k * config.PERSON_CANDIDATE_POOL_FACTOR, config.PERSON_MIN_CANDIDATES),
+                person_index.ntotal,
+            )
             scores, indices = person_index.search(query_emb, n_candidates)
             
             valid = [(int(indices[0][i]), float(scores[0][i]))
@@ -617,7 +628,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
         if os.path.exists(face_index_path):
             face_index = faiss.read_index(face_index_path)
             if face_index.ntotal > 0:
-                n_candidates = min(top_k * 3, face_index.ntotal)
+                n_candidates = min(
+                    max(top_k * config.FACE_CANDIDATE_POOL_FACTOR, config.FACE_MIN_CANDIDATES),
+                    face_index.ntotal,
+                )
                 scores, indices = face_index.search(query_face_emb, n_candidates)
                 
                 valid = [(int(indices[0][i]), float(scores[0][i]))
@@ -649,6 +663,8 @@ def search_by_person(image: Image.Image, top_k: int = None):
                             result = {
                                 "type": "detection", "source": "face",
                                 "detection_id": det_id,
+                                "track_id": r.get("track_id"),
+                                "video_id": r.get("video_id"),
                                 "frame_path": r["frame_path"],
                                 "crop_path": r.get("person_crop_path", r.get("crop_path", "")),
                                 "face_crop_path": r.get("crop_path", ""),
@@ -656,6 +672,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
                                 "frame_number": r["frame_number"],
                                 "video_filename": r["video_filename"],
                                 "video_path": r["video_path"],
+                                "camera_id": r.get("camera_id"),
+                                "location": r.get("location"),
+                                "recording_start_time": r.get("recording_start_time"),
+                                "timezone": r.get("timezone"),
                                 "class_name": "person",
                                 "confidence": r.get("confidence", 0),
                                 "caption": "face match",
@@ -692,12 +712,18 @@ def _format_detection_result(row, source="text"):
     return {
         "type": "detection", "source": source,
         "detection_id": r["id"],
+        "track_id": r.get("track_id"),
+        "video_id": r.get("video_id"),
         "frame_path": r["frame_path"],
         "crop_path": r.get("crop_path", ""),
         "timestamp": r["timestamp"],
         "frame_number": r["frame_number"],
         "video_filename": r["video_filename"],
         "video_path": r["video_path"],
+        "camera_id": r.get("camera_id"),
+        "location": r.get("location"),
+        "recording_start_time": r.get("recording_start_time"),
+        "timezone": r.get("timezone"),
         "class_name": r.get("class_name", ""),
         "confidence": r.get("confidence", 0),
         "caption": r.get("caption", ""),
@@ -713,12 +739,17 @@ def _format_scene_result(row, source="text"):
     score = 1.0 / (1.0 + abs(raw_rank)) if raw_rank is not None else 0
     return {
         "type": "scene", "source": source,
+        "video_id": r.get("video_id"),
         "frame_path": r["frame_path"],
         "crop_path": "",
         "timestamp": r["timestamp"],
         "frame_number": r["frame_number"],
         "video_filename": r["video_filename"],
         "video_path": r["video_path"],
+        "camera_id": r.get("camera_id"),
+        "location": r.get("location"),
+        "recording_start_time": r.get("recording_start_time"),
+        "timezone": r.get("timezone"),
         "class_name": "scene",
         "confidence": 1.0,
         "caption": r.get("caption", ""),

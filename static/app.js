@@ -28,6 +28,12 @@ const modalInfo = document.getElementById('modalInfo');
 const modalClose = document.getElementById('modalClose');
 const cancelIndexBtn = document.getElementById('cancelIndexBtn');
 const loadMoreBtn = document.getElementById('loadMoreBtn');
+const filterVideoId = document.getElementById('filterVideoId');
+const filterCamera = document.getElementById('filterCamera');
+const filterClass = document.getElementById('filterClass');
+const filterStart = document.getElementById('filterStart');
+const filterEnd = document.getElementById('filterEnd');
+const filterGroupTracks = document.getElementById('filterGroupTracks');
 
 // ---- Pagination state ----
 let currentTopK = 30;
@@ -39,6 +45,7 @@ let pollTimer = null;
 let activeTab = 'text';
 let pendingImageFile = null;
 let pendingPersonFile = null;
+let pendingVehicleFile = null;
 
 // ---- Init ----
 document.addEventListener('DOMContentLoaded', () => {
@@ -128,6 +135,41 @@ document.addEventListener('DOMContentLoaded', () => {
         personDropZone.style.display = 'none';
     }
 
+    // ---- Find Vehicle (Vehicle tab) ----
+    const vehicleDropZone = document.getElementById('vehicleDropZone');
+    const vehicleFileInput = document.getElementById('vehicleFileInput');
+    const vehiclePreview = document.getElementById('vehiclePreview');
+    const vehiclePreviewImg = document.getElementById('vehiclePreviewImg');
+    const clearVehicle = document.getElementById('clearVehicle');
+    const vehicleSearchBtn = document.getElementById('vehicleSearchBtn');
+
+    vehicleDropZone.addEventListener('click', () => vehicleFileInput.click());
+    vehicleDropZone.addEventListener('dragover', e => { e.preventDefault(); vehicleDropZone.classList.add('drag-over'); });
+    vehicleDropZone.addEventListener('dragleave', () => vehicleDropZone.classList.remove('drag-over'));
+    vehicleDropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        vehicleDropZone.classList.remove('drag-over');
+        const file = e.dataTransfer.files[0];
+        if (file && file.type.startsWith('image/')) setVehicleFile(file);
+    });
+    vehicleFileInput.addEventListener('change', e => {
+        if (e.target.files[0]) setVehicleFile(e.target.files[0]);
+    });
+    clearVehicle.addEventListener('click', () => {
+        pendingVehicleFile = null;
+        vehiclePreview.style.display = 'none';
+        vehicleDropZone.style.display = '';
+        vehicleFileInput.value = '';
+    });
+    vehicleSearchBtn.addEventListener('click', doVehicleSearch);
+
+    function setVehicleFile(file) {
+        pendingVehicleFile = file;
+        vehiclePreviewImg.src = URL.createObjectURL(file);
+        vehiclePreview.style.display = 'flex';
+        vehicleDropZone.style.display = 'none';
+    }
+
     // ---- Index panel toggle ----
     toggleIndex.addEventListener('click', () => {
         toggleIndex.classList.toggle('active');
@@ -165,7 +207,9 @@ async function doTextSearch() {
     searchBtn.innerHTML = '<span class="spinner"></span>';
     try {
         const mode = searchMode.value;
-        const resp = await fetch(`${API}/api/search?q=${encodeURIComponent(query)}&top_k=${currentTopK}&mode=${mode}`);
+        const params = new URLSearchParams({ q: query, top_k: currentTopK, mode });
+        appendFilterParams(params);
+        const resp = await fetch(`${API}/api/search?${params.toString()}`);
         const data = await resp.json();
         showResults(`Results for "${query}"`, data.count, data.results, false);
     } catch (err) {
@@ -185,7 +229,9 @@ async function doImageSearch() {
     try {
         const formData = new FormData();
         formData.append('file', pendingImageFile);
-        const resp = await fetch(`${API}/api/search-by-image?top_k=${currentTopK}`, { method: 'POST', body: formData });
+        const params = new URLSearchParams({ top_k: currentTopK });
+        appendFilterParams(params);
+        const resp = await fetch(`${API}/api/search-by-image?${params.toString()}`, { method: 'POST', body: formData });
         const data = await resp.json();
         showResults(`Visual match: "${pendingImageFile.name}"`, data.count, data.results, false);
     } catch (err) {
@@ -205,13 +251,37 @@ async function doPersonSearch() {
     try {
         const formData = new FormData();
         formData.append('file', pendingPersonFile);
-        const resp = await fetch(`${API}/api/search-by-person?top_k=${currentTopK}`, { method: 'POST', body: formData });
+        const params = new URLSearchParams({ top_k: currentTopK });
+        appendFilterParams(params, { includeClass: false });
+        const resp = await fetch(`${API}/api/search-by-person?${params.toString()}`, { method: 'POST', body: formData });
         const data = await resp.json();
         showResults(`Person search: "${pendingPersonFile.name}"`, data.count, data.results, true);
     } catch (err) {
         console.error('Person search failed:', err);
     } finally {
         btn.textContent = 'Find This Person';
+    }
+}
+
+// ---- Vehicle Search ----
+async function doVehicleSearch() {
+    if (!pendingVehicleFile) return;
+    currentTopK = 30;
+    lastSearch = { kind: 'vehicle', payload: pendingVehicleFile };
+    const btn = document.getElementById('vehicleSearchBtn');
+    btn.innerHTML = '<span class="spinner"></span>';
+    try {
+        const formData = new FormData();
+        formData.append('file', pendingVehicleFile);
+        const params = new URLSearchParams({ top_k: currentTopK });
+        appendFilterParams(params);
+        const resp = await fetch(`${API}/api/search-by-vehicle?${params.toString()}`, { method: 'POST', body: formData });
+        const data = await resp.json();
+        showResults(`Vehicle search: "${pendingVehicleFile.name}"`, data.count, data.results, false);
+    } catch (err) {
+        console.error('Vehicle search failed:', err);
+    } finally {
+        btn.textContent = 'Find This Vehicle';
     }
 }
 
@@ -224,15 +294,27 @@ async function loadMoreResults() {
         let data;
         if (lastSearch.kind === 'text') {
             const mode = searchMode.value;
-            const resp = await fetch(`${API}/api/search?q=${encodeURIComponent(lastSearch.payload)}&top_k=${currentTopK}&mode=${mode}`);
+            const params = new URLSearchParams({ q: lastSearch.payload, top_k: currentTopK, mode });
+            appendFilterParams(params);
+            const resp = await fetch(`${API}/api/search?${params.toString()}`);
             data = await resp.json();
         } else if (lastSearch.kind === 'image') {
             const fd = new FormData(); fd.append('file', lastSearch.payload);
-            const resp = await fetch(`${API}/api/search-by-image?top_k=${currentTopK}`, { method: 'POST', body: fd });
+            const params = new URLSearchParams({ top_k: currentTopK });
+            appendFilterParams(params);
+            const resp = await fetch(`${API}/api/search-by-image?${params.toString()}`, { method: 'POST', body: fd });
+            data = await resp.json();
+        } else if (lastSearch.kind === 'person') {
+            const fd = new FormData(); fd.append('file', lastSearch.payload);
+            const params = new URLSearchParams({ top_k: currentTopK });
+            appendFilterParams(params, { includeClass: false });
+            const resp = await fetch(`${API}/api/search-by-person?${params.toString()}`, { method: 'POST', body: fd });
             data = await resp.json();
         } else {
             const fd = new FormData(); fd.append('file', lastSearch.payload);
-            const resp = await fetch(`${API}/api/search-by-person?top_k=${currentTopK}`, { method: 'POST', body: fd });
+            const params = new URLSearchParams({ top_k: currentTopK });
+            appendFilterParams(params);
+            const resp = await fetch(`${API}/api/search-by-vehicle?${params.toString()}`, { method: 'POST', body: fd });
             data = await resp.json();
         }
         resultsCount.textContent = `${data.count} found`;
@@ -242,6 +324,16 @@ async function loadMoreResults() {
     } finally {
         loadMoreBtn.textContent = 'Load more results';
     }
+}
+
+function appendFilterParams(params, opts = {}) {
+    const includeClass = opts.includeClass !== false;
+    if (filterVideoId && filterVideoId.value) params.set('video_id', filterVideoId.value);
+    if (filterCamera && filterCamera.value.trim()) params.set('camera_id', filterCamera.value.trim());
+    if (includeClass && filterClass && filterClass.value.trim()) params.set('class_name', filterClass.value.trim());
+    if (filterStart && filterStart.value !== '') params.set('start_time', filterStart.value);
+    if (filterEnd && filterEnd.value !== '') params.set('end_time', filterEnd.value);
+    if (filterGroupTracks && filterGroupTracks.checked) params.set('group_tracks', 'true');
 }
 
 // ---- Cancel indexing ----
@@ -295,9 +387,12 @@ function renderResults(results, isPersonSearch = false) {
         }
 
         // Source badge styling
+        const trackBadge = r.track_id
+            ? `<span class="source-badge">Track #${r.track_id}</span>`
+            : '';
         const sourceBadge = isPersonSearch
-            ? matchBadge
-            : `<span class="source-badge">${r.source}</span>`;
+            ? `${matchBadge}${trackBadge}`
+            : `<span class="source-badge">${r.source}</span>${trackBadge}`;
 
         const clusterSize = (r._cluster && r._cluster.length) ? r._cluster.length : 0;
         const clusterBadge = clusterSize > 0
@@ -435,11 +530,12 @@ async function loadVideos() {
                     </div>
                     <div>
                         <div class="video-name">${escapeHtml(v.filename)}</div>
-                        <div class="video-meta">${v.duration ? formatTime(v.duration) : 'N/A'} · ${v.total_frames || 0} frames</div>
+                        <div class="video-meta">${v.duration ? formatTime(v.duration) : 'N/A'} · ${v.total_frames || 0} frames · ${v.tracks || 0} tracks</div>
                     </div>
                 </div>
                 <div style="display:flex;align-items:center;gap:8px;">
                     <span class="video-status ${v.status}">${v.status}</span>
+                    <button class="track-btn" onclick="viewVideoTracks(${v.id})" title="View tracks">Tracks</button>
                     <button class="delete-btn" onclick="deleteVideo(${v.id})" title="Delete">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -450,6 +546,40 @@ async function loadVideos() {
         `).join('');
     } catch (err) {
         console.error('Load videos error:', err);
+    }
+}
+
+async function viewVideoTracks(id) {
+    try {
+        const resp = await fetch(`${API}/api/videos/${id}/tracks?limit=200`);
+        const data = await resp.json();
+        if (!resp.ok) {
+            alert(data.error || 'Could not load tracks');
+            return;
+        }
+        lastSearch = null;
+        const tracks = (data.tracks || []).map(t => ({
+            type: 'track',
+            source: 'track',
+            track_id: t.id,
+            frame_path: t.frame_path,
+            crop_path: t.crop_path,
+            timestamp: t.start_timestamp,
+            frame_number: t.start_frame_number,
+            video_filename: t.video_filename,
+            video_path: t.video_path,
+            class_name: t.class_name,
+            confidence: t.best_confidence || 0,
+            score: t.best_confidence || 0,
+            detection_count: t.detection_count || 0,
+            track_duration: t.duration || 0,
+            caption: `${t.class_name || 'object'} track · ${t.detection_count || 0} detections · ${formatTime(t.start_timestamp)}-${formatTime(t.end_timestamp)}`,
+            bbox: t.bbox_x1 !== null ? [t.bbox_x1, t.bbox_y1, t.bbox_x2, t.bbox_y2] : null,
+        }));
+        showResults(`Tracks in ${data.video.filename}`, data.count, tracks, false);
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+    } catch (err) {
+        console.error('Load tracks error:', err);
     }
 }
 
@@ -467,12 +597,14 @@ async function deleteVideo(id) {
 function openModal(imgSrc, r) {
     modalImage.src = imgSrc;
     const matchInfo = r.match_type ? `<br><span style="color:var(--success)">Match: ${r.match_type}</span>` : '';
+    const trackInfo = r.track_id ? `<br><span style="color:var(--warning)">Track #${r.track_id}${r.detection_count ? ` · ${r.detection_count} detections` : ''}</span>` : '';
     modalInfo.innerHTML = `
         <strong>${r.video_filename}</strong> · ${formatTime(r.timestamp)}<br>
         ${r.caption ? `<br>${escapeHtml(r.caption)}` : ''}
         ${r.class_name ? `<br><span style="color:var(--accent)">${r.class_name}</span> (${(r.confidence * 100).toFixed(0)}%)` : ''}
         ${r.score ? `<br><span style="opacity:0.5">Score: ${(r.score * 100).toFixed(1)}%</span>` : ''}
         ${matchInfo}
+        ${trackInfo}
     `;
     modalOverlay.classList.add('active');
 }
@@ -485,8 +617,12 @@ function closeModal() {
 // ---- Utils ----
 function formatTime(seconds) {
     if (!seconds && seconds !== 0) return '0:00';
-    const m = Math.floor(seconds / 60);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
+    if (h > 0) {
+        return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
