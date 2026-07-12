@@ -55,27 +55,8 @@ YOLO_WORLD_CONFIDENCE = 0.15
 # CLIP model — ViT-L/14 is much better at colors, clothing, fine-grained attributes
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 CLIP_DIM = 768  # ViT-L/14 uses 768-dim embeddings (ViT-B/32 was 512)
-CLIP_BATCH_SIZE = 32  # ViT-L/14 FP16 forward pass fits comfortably at 32 on 6 GB VRAM;
-                     # halves the number of GPU passes vs. the previous 16.
+CLIP_BATCH_SIZE = 16  # Smaller batch for larger model
 CLIP_MEGA_BATCH = 64  # Increased to 64: forces the GPU to solve 64 frames/faces simultaneously to max out 6GB VRAM
-
-# ---- torch.compile settings ----
-# Enable PyTorch 2.x graph compilation for CLIP / DINOv2 / FaceNet forward passes.
-# First call after startup pays a 30-60s warmup cost; every subsequent call is
-# ~5-15% faster thanks to kernel fusion and reduced Python-level launch overhead.
-# ``mode="default"`` is safer than ``"reduce-overhead"`` on the 6 GB laptop GPU
-# because it does NOT pin CUDA-graph memory for every distinct batch shape, so
-# variable last-batches at the end of a video don't trigger constant recompilation
-# or push VRAM over the limit. Any compile failure falls back to eager silently.
-TORCH_COMPILE_ENABLED = True
-TORCH_COMPILE_MODE = "default"
-
-# Face-detection minimum person size. Persons shorter/narrower than these values
-# cannot yield a detectable face after YOLO-Face internally resizes the crop to
-# 640×640 (the face would be < 6 px). Skipping them makes indexing faster with
-# no recall loss — the faces were never findable in the first place.
-FACE_MIN_PERSON_WIDTH = 40
-FACE_MIN_PERSON_HEIGHT = 80
 
 # Dedicated Biometric Models — Pure PyTorch (C++ Free)
 REID_MODEL_NAME = "dinov2_vits14" # DINOv2 ViT-Small for body Re-ID
