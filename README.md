@@ -1,6 +1,6 @@
 # 🔍 Vision-Search Agent
 
-**Context-Aware Video Retrieval** — A local, GPU-accelerated video search engine that finds specific people and objects in videos using natural language, image similarity, or person re-identification.
+**Context-Aware Video Retrieval** — A local, GPU-accelerated CCTV/video search engine that finds people, vehicles, and objects using natural language, image similarity, person re-identification, and track-level investigation tools.
 
 ---
 
@@ -36,13 +36,13 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 | Component | File | Description |
 |---|---|---|
 | **Config** | `config.py` | All settings: FPS, model paths, thresholds, server port |
-| **Models** | `models.py` | CLIP encoding, YOLO detection, DINOv2 Re-ID, FaceNet identity, Ollama VLM |
+| **Models** | `models.py` | CLIP encoding, YOLO detection, DINOv2 Re-ID, FaceNet identity, optional Ollama VLM hooks |
 | **Database** | `database.py` | SQLite with FTS5 full-text search for metadata & captions |
 | **Indexer** | `indexer.py` | Video → frames → YOLO crops → CLIP/DINOv2/FaceNet embeddings (mega-batched) |
 | **Tracker** | `tracker.py` | Lightweight per-class IoU tracker for CCTV person/vehicle/object event grouping |
-| **Searcher** | `searcher.py` | 3-stage smart search: CLIP recall → YOLO-World re-rank → temporal boost |
+| **Searcher** | `searcher.py` | Smart search: CLIP/BM25 recall → YOLO-World re-rank → filters, clustering, and track grouping |
 | **API Server** | `app.py` | FastAPI REST API + static file serving |
-| **Frontend** | `static/` | Dark-themed web UI with text, image, and person search tabs |
+| **Frontend** | `static/` | Dark-themed web UI with text, image, person, vehicle, CCTV filter, and track browsing tools |
 
 ## Tech Stack
 
@@ -52,7 +52,7 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 - **Vector Embeddings**: CLIP ViT-L/14 (768-dim, FP16 on GPU)
 - **Person Re-ID**: DINOv2 ViT-S/14 (384-dim body appearance matching)
 - **Face Recognition**: FaceNet InceptionResnetV1 (512-dim identity matching)
-- **VLM Captioning**: Qwen3-VL 2B via Ollama (optional, for rich text descriptions)
+- **VLM Captioning**: Qwen3-VL 2B via Ollama (optional hook; not required for the default UI workflow)
 - **Vector Search**: FAISS (3 separate indexes: general, person, face)
 - **Tracking**: persistent IoU tracks (`tracks`, `track_detections`, `track_attributes`) for CCTV event grouping
 - **Text Search**: SQLite FTS5
@@ -65,7 +65,7 @@ Search Query ──► CLIP Recall (Stage 1) ──► YOLO-World Re-ranking (St
 
 1. **Python 3.10+** with a virtual environment
 2. **CUDA GPU** recommended (6GB+ VRAM) — falls back to CPU
-3. **Ollama** (optional, for VLM captions):
+3. **Ollama** (optional; only needed if you enable/extend VLM captioning):
    ```bash
    ollama pull qwen3-vl:2b
    ```
@@ -89,7 +89,7 @@ pip install -r requirements.txt
 ## Running
 
 ```bash
-# (Optional) Start Ollama for VLM captions
+# (Optional) Start Ollama only if you enable VLM captioning
 ollama serve
 
 # Start the Vision-Search Agent
@@ -98,16 +98,15 @@ python app.py
 
 Open **http://localhost:8420** in your browser.
 
-> **Note:** On first launch, all AI models are loaded into memory (10-20 seconds). Subsequent searches are instant.
+> **Note:** On first launch, AI models are loaded into memory. Startup is usually fast after models are cached, but first downloads, CPU mode, or heavy GPU initialization can take longer than 10-20 seconds.
 
 ## Usage
 
 ### 1. Index a Video
 - Click **"+ Index New Video"** to expand the panel
 - Paste a video file path (e.g., `D:\videos\sample.mp4`) or a directory
-- Options:
-  - ✅ **CLIP Embeddings** — vector embeddings + DINOv2 + FaceNet (recommended)
-  - ✅ **VLM Captions** — Ollama generates text descriptions (slower, optional)
+- Option:
+  - ✅ **CLIP + YOLO Indexing** — frame/object vectors + DINOv2 person Re-ID + FaceNet face identity + CCTV tracks (recommended)
 - Click **Start Indexing** and watch the progress bar
 - Click **Cancel** to pause; the job resumes automatically on the next indexing call
 - If a video fails, its row is marked `failed` (with error message) and can be retried
@@ -118,7 +117,7 @@ Open **http://localhost:8420** in your browser.
   - `"person in black shirt with bag"`
   - `"red car"`, `"man walking"`, `"woman with glasses"`
 - Supports negative prompts: `"person in jacket --no hat"`
-- Search modes: **Hybrid** (default), **Text** only, **CLIP** only
+- UI search modes: **Smart (2-Stage)** and **CLIP Only**. The API also accepts `mode=text` for SQLite FTS-only search.
 - Optional CCTV filters narrow long videos by video ID, camera ID, class, time range, and track grouping
 
 ### 3. Image Search
@@ -141,15 +140,15 @@ Open **http://localhost:8420** in your browser.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/search?q=...&top_k=20&mode=hybrid` | Text search indexed videos |
-| `POST` | `/api/search-by-image` | Image similarity search (multipart file upload) |
-| `POST` | `/api/search-by-person` | Person re-identification (multipart file upload) |
-| `POST` | `/api/search-by-vehicle` | Vehicle-focused image search, filtered to vehicle classes |
+| `GET` | `/api/search?q=...&top_k=20&mode=hybrid` | Text search indexed videos; supports CCTV filters and `group_tracks=true` |
+| `POST` | `/api/search-by-image` | Image similarity search (multipart upload); supports CCTV filters and optional track grouping |
+| `POST` | `/api/search-by-person` | Person re-identification (multipart upload); supports camera/time/match filters |
+| `POST` | `/api/search-by-vehicle` | Vehicle-focused image search, filtered to vehicle classes and grouped by track by default |
 | `GET` | `/api/videos/{id}/tracks` | List representative CCTV tracks for a video |
 | `GET` | `/api/tracks/{id}` | Ordered detection timeline for one track |
 | `GET` | `/api/tracks/{id}/export?format=json\|csv` | Export track evidence report |
 | `GET` | `/api/tracks/stats` | Aggregate track counts by class |
-| `POST` | `/api/index` | Start indexing (body: `{path, use_vlm, use_clip}`) |
+| `POST` | `/api/index` | Start indexing (body: `{path, use_vlm, use_clip, camera_id, location, recording_start_time, timezone, index_profile}`) |
 | `POST` | `/api/index/cancel` | Cooperatively stop the current indexing job (state → `paused`) |
 | `GET` | `/api/index/health` | Integrity check: DB vector refs vs FAISS counts and missing image files |
 | `GET` | `/api/status` | Get current indexing progress |
@@ -181,6 +180,7 @@ FRAME_JPEG_QUALITY = 85        # On-disk frame quality (Phase 5)
 CROP_JPEG_QUALITY = 85         # On-disk detection-crop quality
 FACE_JPEG_QUALITY = 90         # On-disk face-crop quality (higher = preserve identity cues)
 OLLAMA_VLM_MODEL = "qwen3-vl:2b"
+VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle", "train", "boat"}
 PORT = 8420
 ```
 
@@ -221,8 +221,8 @@ Designed to handle **multi-hour videos** and large corpora without falling over:
 - **Attribute-preserving parsing** — color words (`black`, `white`, `red`, …) are **not** treated as stopwords
   when constructing YOLO-World classes, so `"black jacket"` searches for black jackets rather than any jacket.
 - **Negative prompts** — `"person with jacket --no hat"` subtracts the negative embedding at 0.5 strength.
-- **YOLO-World re-rank** operates on detection crops (when available) instead of full frames, avoiding
-  background-object noise.
+- **YOLO-World re-rank** operates on full frames so small scene objects (`ring`, `bag`, `hat`) are not missed
+  just because the first-stage candidate came from a person/object crop.
 - **BM25 normalization** — FTS scores are transformed to `1 / (1 + |rank|)` so text and CLIP scores merge
   cleanly instead of having text scores dominate.
 - **Person search** — FaceNet is only invoked when YOLO-Face actually detects a face in the query image,
@@ -236,8 +236,8 @@ Designed to handle **multi-hour videos** and large corpora without falling over:
 
 ## Performance
 
-- **Indexing**: ~2-5 frames/sec on GPU (depends on video resolution and detection count)
-- **Text Search**: <2 seconds (CLIP recall + YOLO-World re-ranking)
-- **Image Search**: <1 second
-- **Person Search**: <1 second
-- Scene-change deduplication skips redundant frames automatically
+- **Indexing**: depends heavily on GPU, video resolution, people per frame, and face count. A 60-second CCTV sample at 1 FPS with CLIP + DINOv2 + FaceNet produced ~0.36 sampled frames/sec on the tested setup; faster GPUs and fewer detections will be faster.
+- **Text Search**: usually <2 seconds for small/medium indexes; YOLO-World re-ranking adds latency.
+- **Image Search**: usually <1 second after models are loaded.
+- **Person Search**: usually <1 second after models are loaded.
+- **Scene skipping**: enabled only for `fast_preview`; disabled by default in `investigation` and `high_sensitivity` profiles so static CCTV backgrounds do not hide small moving people/objects.
