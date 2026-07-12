@@ -447,11 +447,20 @@ def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_in
     # --- 6. Batch Face detection + FaceNet encode for person crops ---
     person_regions = []
     person_meta = []  # (bi, ci, px1, py1, px2, py2, det_id, frame_id, frame_no)
-    
+
+    # A person shorter than ~80 px or narrower than ~40 px cannot produce a face
+    # detectable by YOLO-Face after it resizes the crop to 640² (the face itself
+    # would be < 6 px). Skipping these person crops removes a large chunk of the
+    # per-batch YOLO-Face cost with zero recall loss.
+    min_pw = int(getattr(config, "FACE_MIN_PERSON_WIDTH", 0))
+    min_ph = int(getattr(config, "FACE_MIN_PERSON_HEIGHT", 0))
+
     for bi, mb in enumerate(mega_batch):
         for ci, rec in enumerate(mb["crop_records"]):
             if rec["class_name"] != "person": continue
             px1, py1, px2, py2 = rec["bbox"]
+            if (px2 - px1) < min_pw or (py2 - py1) < min_ph:
+                continue
             if mb.get("frame_bgr_ref") is not None:
                 region = mb["frame_bgr_ref"][py1:py2, px1:px2]
                 if region.size > 0:
@@ -518,46 +527,69 @@ def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_in
 
 def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True,
                 camera_id: str = None, location: str = None, recording_start_time: str = None,
-                timezone: str = None, index_profile: str = None):
+                timezone: str = None, index_profile: str = None,
+                yolo_classes: list = None, yolo_confidence: float = None):
     """Public entry: index one video with crash-safe error handling.
 
     On any unhandled exception we mark the video as ``failed`` (with the
     exception message stored in ``videos.error_message``) so it can be
     diagnosed or reindexed later, and we reset ``indexing_status`` so the
     UI recovers.
+
+    Per-job overrides:
+        ``yolo_classes`` and ``yolo_confidence`` temporarily mutate the
+        corresponding ``config`` module attributes for the lifetime of
+        this call, then restore them in a ``finally`` block. This lets
+        the caller (POST /api/index) change detection settings for the
+        next job after a cancel, without restarting the process.
     """
     global indexing_status
     _pre_video_path = os.path.abspath(video_path)
     _existing = db.get_video_by_path(_pre_video_path)
+
+    # --- per-job config overrides (restored in finally) ---
+    _original_classes = config.YOLO_CLASSES
+    _original_conf = config.YOLO_CONFIDENCE
     try:
-        return _index_video_impl(
-            video_path,
-            use_vlm=use_vlm,
-            use_clip=use_clip,
-            camera_id=camera_id,
-            location=location,
-            recording_start_time=recording_start_time,
-            timezone=timezone,
-            index_profile=index_profile,
-        )
-    except IndexingCancelled:
-        # Not an error path \u2014 request_cancel() sets status via the impl.
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+        if yolo_classes is not None:
+            config.YOLO_CLASSES = list(yolo_classes)
+            print(f"[indexer] Override YOLO_CLASSES = {config.YOLO_CLASSES}")
+        if yolo_confidence is not None:
+            config.YOLO_CONFIDENCE = float(yolo_confidence)
+            print(f"[indexer] Override YOLO_CONFIDENCE = {config.YOLO_CONFIDENCE}")
+
         try:
-            vid_row = db.get_video_by_path(_pre_video_path) or _existing
-            if vid_row is not None:
-                db.set_video_error(int(vid_row["id"]), f"{type(e).__name__}: {e}")
-        except Exception as inner:
-            print(f"[indexer] failed to persist error state: {inner}")
-        indexing_status.update({
-            "active": False,
-            "cancel_requested": False,
-            "message": f"FAILED: {type(e).__name__}: {e}",
-        })
-        return
+            return _index_video_impl(
+                video_path,
+                use_vlm=use_vlm,
+                use_clip=use_clip,
+                camera_id=camera_id,
+                location=location,
+                recording_start_time=recording_start_time,
+                timezone=timezone,
+                index_profile=index_profile,
+            )
+        except IndexingCancelled:
+            # Not an error path \u2014 request_cancel() sets status via the impl.
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                vid_row = db.get_video_by_path(_pre_video_path) or _existing
+                if vid_row is not None:
+                    db.set_video_error(int(vid_row["id"]), f"{type(e).__name__}: {e}")
+            except Exception as inner:
+                print(f"[indexer] failed to persist error state: {inner}")
+            indexing_status.update({
+                "active": False,
+                "cancel_requested": False,
+                "message": f"FAILED: {type(e).__name__}: {e}",
+            })
+            return
+    finally:
+        config.YOLO_CLASSES = _original_classes
+        config.YOLO_CONFIDENCE = _original_conf
 
 
 def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = True,
@@ -872,7 +904,8 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
 def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
                     camera_id: str = None, location: str = None, recording_start_time: str = None,
-                    timezone: str = None, index_profile: str = None):
+                    timezone: str = None, index_profile: str = None,
+                    yolo_classes: list = None, yolo_confidence: float = None):
     """Recursively index all video files in a directory."""
     exts = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"}
     videos = [os.path.join(r, f) for r, _, fs in os.walk(dir_path)
@@ -888,6 +921,8 @@ def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
             recording_start_time=recording_start_time,
             timezone=timezone,
             index_profile=index_profile,
+            yolo_classes=yolo_classes,
+            yolo_confidence=yolo_confidence,
         )
 
 

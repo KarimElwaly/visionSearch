@@ -53,6 +53,12 @@ class IndexRequest(BaseModel):
     recording_start_time: str | None = None
     timezone: str | None = None
     index_profile: str | None = None
+    # Optional per-job overrides. Applied to the config module for the duration
+    # of one indexing run and restored on finish/cancel/error, so you can
+    # cancel a running job, POST /api/index with different classes/confidence,
+    # and have the resume honour the new settings without restarting Uvicorn.
+    yolo_classes: list[int] | None = None
+    yolo_confidence: float | None = None
 
 
 def _expanded_top_k(top_k: int, *filters) -> int:
@@ -195,7 +201,9 @@ async def api_search(
     search_top_k = _expanded_top_k(
         top_k, video_id, camera_id, class_name, start_time, end_time, min_score, match_type, group_tracks
     )
-    results = searcher.search(q, top_k=search_top_k, mode=mode)
+    # Run the (potentially slow) CLIP+YOLO-World pipeline on a worker thread so
+    # /api/status polls and other requests stay responsive during a search.
+    results = await asyncio.to_thread(searcher.search, q, search_top_k, mode)
     results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score, match_type)
     if group_tracks:
         results = _group_results_by_track(results)
@@ -219,7 +227,7 @@ async def api_search_by_image(
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
     search_top_k = _expanded_top_k(top_k, video_id, camera_id, class_name, start_time, end_time, min_score, group_tracks)
-    results = searcher.search_by_image(image, top_k=search_top_k)
+    results = await asyncio.to_thread(searcher.search_by_image, image, search_top_k)
     results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score)
     if group_tracks:
         results = _group_results_by_track(results)
@@ -243,7 +251,7 @@ async def api_search_by_vehicle(
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
     search_top_k = _expanded_top_k(top_k, video_id, camera_id, class_name, start_time, end_time, min_score, group_tracks)
-    results = searcher.search_by_image(image, top_k=max(search_top_k, 100))
+    results = await asyncio.to_thread(searcher.search_by_image, image, max(search_top_k, 100))
     vehicle_classes = {c.lower() for c in config.VEHICLE_CLASSES}
     results = [r for r in results if str(r.get("class_name") or "").lower() in vehicle_classes]
     results = _filter_results(results, video_id, camera_id, class_name, start_time, end_time, min_score)
@@ -270,7 +278,7 @@ async def api_search_by_person(
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
     search_top_k = _expanded_top_k(top_k, video_id, camera_id, start_time, end_time, min_score, match_type, group_tracks)
-    results = searcher.search_by_person(image, top_k=search_top_k)
+    results = await asyncio.to_thread(searcher.search_by_person, image, search_top_k)
     results = _filter_results(results, video_id, camera_id, "person", start_time, end_time, min_score, match_type)
     if group_tracks:
         results = _group_results_by_track(results)
@@ -299,6 +307,8 @@ async def api_index(req: IndexRequest, background_tasks: BackgroundTasks):
                 recording_start_time=req.recording_start_time,
                 timezone=req.timezone,
                 index_profile=req.index_profile,
+                yolo_classes=req.yolo_classes,
+                yolo_confidence=req.yolo_confidence,
             )
         else:
             indexer.index_video(
@@ -310,6 +320,8 @@ async def api_index(req: IndexRequest, background_tasks: BackgroundTasks):
                 recording_start_time=req.recording_start_time,
                 timezone=req.timezone,
                 index_profile=req.index_profile,
+                yolo_classes=req.yolo_classes,
+                yolo_confidence=req.yolo_confidence,
             )
     
     thread = Thread(target=_run, daemon=True)
