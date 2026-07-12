@@ -286,6 +286,48 @@ def crop_detection(frame_bgr: np.ndarray, bbox: tuple, pad_ratio: float = 0.1) -
     return Image.fromarray(crop)
 
 
+def _detect_track_crop_batch(mega_batch, object_tracker, io_executor, video_frames_dir):
+    """Run YOLO + IoU tracker + crop persistence for one mega-batch.
+
+    Mutates each ``mb`` in ``mega_batch`` in place by setting ``detections``,
+    ``crop_images`` and ``crop_records``. Returns the total number of YOLO
+    detections produced so callers can update aggregate counters.
+    Extracted from ``_index_video_impl`` so the main loop and the remainder
+    flush share one implementation.
+    """
+    if not mega_batch:
+        return 0
+
+    bgr_frames = [mb["frame_bgr_ref"] for mb in mega_batch]
+    batch_dets = models.detect_objects_batch(bgr_frames)
+
+    total = 0
+    for mb, dets in zip(mega_batch, batch_dets):
+        mb["detections"] = dets
+        total += len(dets)
+        track_assignments = object_tracker.update(mb["frame_no"], mb["timestamp"], dets)
+        for di, det in enumerate(dets):
+            track_assignment = track_assignments[di] if di < len(track_assignments) else {}
+            crop_img = crop_detection(mb["frame_bgr_ref"], det["bbox"])
+            crop_filename = f"frame_{mb['frame_no']:06d}_det_{di}.jpg"
+            crop_path = os.path.join(video_frames_dir, crop_filename)
+            io_executor.submit(
+                lambda img=crop_img, p=crop_path, q=config.CROP_JPEG_QUALITY:
+                    img.save(p, format="JPEG", quality=q)
+            )
+            mb["crop_images"].append(crop_img)
+            mb["crop_records"].append({
+                "class_name": det["class_name"],
+                "confidence": det["confidence"],
+                "bbox": det["bbox"],
+                "crop_path": crop_path,
+                "track_local_id": track_assignment.get("track_local_id"),
+                "track_iou": track_assignment.get("track_iou"),
+                "track_is_new": track_assignment.get("track_is_new", False),
+            })
+    return total
+
+
 def _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
                       use_clip, video_id, io_executor, video_frames_dir):
     """Process a mega-batch: bulk CLIP encode + batch DB inserts.
@@ -704,30 +746,9 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
         # Process and flush mega-batch when full
         if len(mega_batch) >= config.CLIP_MEGA_BATCH:
-            # 1. Batch YOLO Object Detection
-            bgr_frames = [mb["frame_bgr_ref"] for mb in mega_batch]
-            batch_dets = models.detect_objects_batch(bgr_frames)
-
-            for mb, dets in zip(mega_batch, batch_dets):
-                mb["detections"] = dets
-                total_detections += len(dets)
-                track_assignments = object_tracker.update(mb["frame_no"], mb["timestamp"], dets)
-                for di, det in enumerate(dets):
-                    track_assignment = track_assignments[di] if di < len(track_assignments) else {}
-                    crop_img = crop_detection(mb["frame_bgr_ref"], det["bbox"])
-                    crop_filename = f"frame_{mb['frame_no']:06d}_det_{di}.jpg"
-                    crop_path = os.path.join(video_frames_dir, crop_filename)
-                    io_executor.submit(lambda img=crop_img, p=crop_path, q=config.CROP_JPEG_QUALITY: img.save(p, format="JPEG", quality=q))
-                    mb["crop_images"].append(crop_img)
-                    mb["crop_records"].append({
-                        "class_name": det["class_name"],
-                        "confidence": det["confidence"],
-                        "bbox": det["bbox"],
-                        "crop_path": crop_path,
-                        "track_local_id": track_assignment.get("track_local_id"),
-                        "track_iou": track_assignment.get("track_iou"),
-                        "track_is_new": track_assignment.get("track_is_new", False),
-                    })
+            total_detections += _detect_track_crop_batch(
+                mega_batch, object_tracker, io_executor, video_frames_dir
+            )
 
             _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
                              use_clip, video_id, io_executor, video_frames_dir)
@@ -770,29 +791,10 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
     # Flush remaining frames
     if mega_batch and not cancelled:
-        bgr_frames = [mb["frame_bgr_ref"] for mb in mega_batch]
-        batch_dets = models.detect_objects_batch(bgr_frames)
-        for mb, dets in zip(mega_batch, batch_dets):
-            mb["detections"] = dets
-            total_detections += len(dets)
-            track_assignments = object_tracker.update(mb["frame_no"], mb["timestamp"], dets)
-            for di, det in enumerate(dets):
-                track_assignment = track_assignments[di] if di < len(track_assignments) else {}
-                crop_img = crop_detection(mb["frame_bgr_ref"], det["bbox"])
-                crop_filename = f"frame_{mb['frame_no']:06d}_det_{di}.jpg"
-                crop_path = os.path.join(video_frames_dir, crop_filename)
-                io_executor.submit(lambda img=crop_img, p=crop_path, q=config.CROP_JPEG_QUALITY: img.save(p, format="JPEG", quality=q))
-                mb["crop_images"].append(crop_img)
-                mb["crop_records"].append({
-                    "class_name": det["class_name"],
-                    "confidence": det["confidence"],
-                    "bbox": det["bbox"],
-                    "crop_path": crop_path,
-                    "track_local_id": track_assignment.get("track_local_id"),
-                    "track_iou": track_assignment.get("track_iou"),
-                    "track_is_new": track_assignment.get("track_is_new", False),
-                })
-                
+        total_detections += _detect_track_crop_batch(
+            mega_batch, object_tracker, io_executor, video_frames_dir
+        )
+
         _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
                          use_clip, video_id, io_executor, video_frames_dir)
         processed += len(mega_batch)

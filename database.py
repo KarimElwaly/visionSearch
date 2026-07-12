@@ -441,33 +441,58 @@ def get_faiss_ids_for_video(video_id: int) -> dict:
 
 
 def get_storage_stats() -> dict:
-    """Aggregate per-video counts (rows in each table) for the storage endpoint."""
+    """Aggregate per-video counts (rows in each table) for the storage endpoint.
+
+    Uses grouped aggregate queries instead of per-video COUNT() calls so this
+    stays O(1) queries even with hundreds of videos in the archive.
+    """
     with get_db() as conn:
         videos = conn.execute(
             """SELECT id, filename, path, duration, status, camera_id, location,
                       recording_start_time, timezone, index_profile
                FROM videos"""
         ).fetchall()
+
+        frame_counts = {
+            row["video_id"]: row["n"] for row in conn.execute(
+                "SELECT video_id, COUNT(*) AS n FROM frames GROUP BY video_id"
+            )
+        }
+        det_counts = {
+            row["video_id"]: row["n"] for row in conn.execute(
+                """SELECT f.video_id AS video_id, COUNT(*) AS n
+                   FROM detections d
+                   JOIN frames f ON f.id = d.frame_id
+                   GROUP BY f.video_id"""
+            )
+        }
+        face_counts = {
+            row["video_id"]: row["n"] for row in conn.execute(
+                """SELECT f.video_id AS video_id, COUNT(*) AS n
+                   FROM faces fc
+                   JOIN frames f ON f.id = fc.frame_id
+                   GROUP BY f.video_id"""
+            )
+        }
+        track_counts = {
+            row["video_id"]: row["n"] for row in conn.execute(
+                "SELECT video_id, COUNT(*) AS n FROM tracks GROUP BY video_id"
+            )
+        }
+
         rows = []
         for v in videos:
             vid = v["id"]
-            frames_n = conn.execute("SELECT COUNT(*) AS n FROM frames WHERE video_id = ?", (vid,)).fetchone()["n"]
-            det_n = conn.execute(
-                "SELECT COUNT(*) AS n FROM detections d JOIN frames f ON f.id = d.frame_id WHERE f.video_id = ?",
-                (vid,)
-            ).fetchone()["n"]
-            face_n = conn.execute(
-                "SELECT COUNT(*) AS n FROM faces fc JOIN frames f ON f.id = fc.frame_id WHERE f.video_id = ?",
-                (vid,)
-            ).fetchone()["n"]
-            track_n = conn.execute("SELECT COUNT(*) AS n FROM tracks WHERE video_id = ?", (vid,)).fetchone()["n"]
             rows.append({
                 "id": vid, "filename": v["filename"], "path": v["path"],
                 "duration": v["duration"], "status": v["status"],
                 "camera_id": v["camera_id"], "location": v["location"],
                 "recording_start_time": v["recording_start_time"], "timezone": v["timezone"],
                 "index_profile": v["index_profile"],
-                "frames": frames_n, "detections": det_n, "faces": face_n, "tracks": track_n,
+                "frames": int(frame_counts.get(vid, 0)),
+                "detections": int(det_counts.get(vid, 0)),
+                "faces": int(face_counts.get(vid, 0)),
+                "tracks": int(track_counts.get(vid, 0)),
             })
     return {"videos": rows, "tracks": get_track_stats()}
 

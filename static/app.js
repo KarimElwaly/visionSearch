@@ -87,6 +87,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     clearImage.addEventListener('click', () => {
         pendingImageFile = null;
+        revokePreviewUrl(previewImg);
         imagePreview.style.display = 'none';
         imageDropZone.style.display = '';
         imageFileInput.value = '';
@@ -95,6 +96,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function setImageFile(file) {
         pendingImageFile = file;
+        // Revoke any previous blob URL before assigning a new one so we don't
+        // leak object URLs for each preview swap.
+        revokePreviewUrl(previewImg);
         previewImg.src = URL.createObjectURL(file);
         imagePreview.style.display = 'flex';
         imageDropZone.style.display = 'none';
@@ -122,6 +126,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     clearPerson.addEventListener('click', () => {
         pendingPersonFile = null;
+        revokePreviewUrl(personPreviewImg);
         personPreview.style.display = 'none';
         personDropZone.style.display = '';
         personFileInput.value = '';
@@ -130,6 +135,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function setPersonFile(file) {
         pendingPersonFile = file;
+        revokePreviewUrl(personPreviewImg);
         personPreviewImg.src = URL.createObjectURL(file);
         personPreview.style.display = 'flex';
         personDropZone.style.display = 'none';
@@ -157,6 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     clearVehicle.addEventListener('click', () => {
         pendingVehicleFile = null;
+        revokePreviewUrl(vehiclePreviewImg);
         vehiclePreview.style.display = 'none';
         vehicleDropZone.style.display = '';
         vehicleFileInput.value = '';
@@ -165,6 +172,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function setVehicleFile(file) {
         pendingVehicleFile = file;
+        revokePreviewUrl(vehiclePreviewImg);
         vehiclePreviewImg.src = URL.createObjectURL(file);
         vehiclePreview.style.display = 'flex';
         vehicleDropZone.style.display = 'none';
@@ -631,4 +639,18 @@ function escapeHtml(text) {
     const d = document.createElement('div');
     d.textContent = text;
     return d.innerHTML;
+}
+
+/**
+ * Release the blob URL currently assigned to an <img> preview so the browser
+ * can free its underlying Blob. Called before assigning a new preview image
+ * and when clearing the preview, preventing an object-URL leak per upload.
+ */
+function revokePreviewUrl(imgEl) {
+    if (!imgEl) return;
+    const src = imgEl.src;
+    if (src && src.startsWith('blob:')) {
+        try { URL.revokeObjectURL(src); } catch (_) { /* ignore */ }
+    }
+    imgEl.removeAttribute('src');
 }

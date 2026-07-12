@@ -13,6 +13,7 @@ Stage 3: VLM Verification (optional, ~5-10 seconds)
   → Adds rich text captions for display
 """
 import os
+import threading
 import numpy as np
 import faiss
 from PIL import Image
@@ -23,10 +24,53 @@ import database as db
 import models
 
 
+# ---- Cached FAISS index loaders ----
+#
+# Reading a FAISS index from disk on every request is prohibitive for large
+# indexes (100k+ vectors → seconds per search). We keep the index resident in
+# memory and invalidate the cache when the on-disk file mtime changes (which
+# happens after every indexing checkpoint / cascade delete).
+_FAISS_CACHE: dict[str, tuple[float, int, "faiss.Index"]] = {}
+_FAISS_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_faiss(path: str):
+    """Return the FAISS index at ``path`` with mtime-based cache invalidation.
+
+    Returns None when the file does not exist yet (no vectors indexed).
+    """
+    if not os.path.exists(path):
+        # Drop any stale cache entry so a deleted index isn't served.
+        with _FAISS_CACHE_LOCK:
+            _FAISS_CACHE.pop(path, None)
+        return None
+    try:
+        stat = os.stat(path)
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+    with _FAISS_CACHE_LOCK:
+        cached = _FAISS_CACHE.get(path)
+        if cached is not None and cached[0] == signature:
+            return cached[2]
+
+    # Load outside the lock (can take a while on large indexes) then re-check.
+    try:
+        idx = faiss.read_index(path)
+    except Exception as exc:
+        print(f"[search] failed to read FAISS index {path}: {exc}")
+        return None
+
+    with _FAISS_CACHE_LOCK:
+        # Double-check nothing raced past us with a newer mtime.
+        _FAISS_CACHE[path] = (signature, idx.ntotal, idx)
+    return idx
+
+
 def _load_faiss_index():
-    if os.path.exists(config.FAISS_INDEX_PATH):
-        return faiss.read_index(config.FAISS_INDEX_PATH)
-    return None
+    """Backwards-compatible accessor for the general (CLIP) FAISS index."""
+    return _get_cached_faiss(config.FAISS_INDEX_PATH)
 
 
 # ---- YOLO-World for open-vocabulary re-ranking ----
@@ -589,10 +633,9 @@ def search_by_person(image: Image.Image, top_k: int = None):
         print("[search] Query image is a tight face crop. Disabling Body Re-ID to prevent inaccurate clothing matches.")
 
     # --- Stage 1: Person Re-ID Index ---
-    person_index_path = config.PERSON_FAISS_INDEX_PATH
-    if os.path.exists(person_index_path) and query_emb is not None:
-        person_index = faiss.read_index(person_index_path)
-        if person_index.ntotal > 0:
+    if query_emb is not None:
+        person_index = _get_cached_faiss(config.PERSON_FAISS_INDEX_PATH)
+        if person_index is not None and person_index.ntotal > 0:
             n_candidates = min(
                 max(top_k * config.PERSON_CANDIDATE_POOL_FACTOR, config.PERSON_MIN_CANDIDATES),
                 person_index.ntotal,
@@ -624,66 +667,64 @@ def search_by_person(image: Image.Image, top_k: int = None):
 
     # --- Stage 2: Face Index ---
     if query_face_emb is not None:
-        face_index_path = config.FACE_FAISS_INDEX_PATH
-        if os.path.exists(face_index_path):
-            face_index = faiss.read_index(face_index_path)
-            if face_index.ntotal > 0:
-                n_candidates = min(
-                    max(top_k * config.FACE_CANDIDATE_POOL_FACTOR, config.FACE_MIN_CANDIDATES),
-                    face_index.ntotal,
-                )
-                scores, indices = face_index.search(query_face_emb, n_candidates)
-                
-                valid = [(int(indices[0][i]), float(scores[0][i]))
-                         for i in range(len(indices[0]))
-                         if indices[0][i] >= 0 and float(scores[0][i]) >= config.FACE_MATCH_THRESHOLD]
-                
-                print(f"[search] Face match: {len(valid)} matches (threshold {config.FACE_MATCH_THRESHOLD})")
-                
-                if valid:
-                    faiss_ids = [fid for fid, _ in valid]
-                    score_map = {fid: score for fid, score in valid}
-                    
-                    face_results = db.get_faces_by_faiss_ids(faiss_ids)
-                    for r in face_results:
-                        r = dict(r)  # sqlite3.Row → dict for .get()
-                        det_id = r["detection_id"]
-                        key = f"person_{det_id}"
-                        face_score = score_map.get(r["face_faiss_id"], 0)
-                        
-                        if key in seen_keys:
-                            # Already found via body — boost with face score
-                            for existing in results:
-                                if existing.get("detection_id") == det_id:
-                                    existing["score"] = existing["score"] * 0.3 + face_score * 0.7
-                                    existing["match_type"] = "body+face"
-                                    break
-                        else:
-                            seen_keys.add(key)
-                            result = {
-                                "type": "detection", "source": "face",
-                                "detection_id": det_id,
-                                "track_id": r.get("track_id"),
-                                "video_id": r.get("video_id"),
-                                "frame_path": r["frame_path"],
-                                "crop_path": r.get("person_crop_path", r.get("crop_path", "")),
-                                "face_crop_path": r.get("crop_path", ""),
-                                "timestamp": r["timestamp"],
-                                "frame_number": r["frame_number"],
-                                "video_filename": r["video_filename"],
-                                "video_path": r["video_path"],
-                                "camera_id": r.get("camera_id"),
-                                "location": r.get("location"),
-                                "recording_start_time": r.get("recording_start_time"),
-                                "timezone": r.get("timezone"),
-                                "class_name": "person",
-                                "confidence": r.get("confidence", 0),
-                                "caption": "face match",
-                                "bbox": None,
-                                "score": face_score * 0.9,  # Face-only match
-                                "match_type": "face",
-                            }
-                            results.append(result)
+        face_index = _get_cached_faiss(config.FACE_FAISS_INDEX_PATH)
+        if face_index is not None and face_index.ntotal > 0:
+            n_candidates = min(
+                max(top_k * config.FACE_CANDIDATE_POOL_FACTOR, config.FACE_MIN_CANDIDATES),
+                face_index.ntotal,
+            )
+            scores, indices = face_index.search(query_face_emb, n_candidates)
+
+            valid = [(int(indices[0][i]), float(scores[0][i]))
+                     for i in range(len(indices[0]))
+                     if indices[0][i] >= 0 and float(scores[0][i]) >= config.FACE_MATCH_THRESHOLD]
+
+            print(f"[search] Face match: {len(valid)} matches (threshold {config.FACE_MATCH_THRESHOLD})")
+
+            if valid:
+                faiss_ids = [fid for fid, _ in valid]
+                score_map = {fid: score for fid, score in valid}
+
+                face_results = db.get_faces_by_faiss_ids(faiss_ids)
+                for r in face_results:
+                    r = dict(r)  # sqlite3.Row → dict for .get()
+                    det_id = r["detection_id"]
+                    key = f"person_{det_id}"
+                    face_score = score_map.get(r["face_faiss_id"], 0)
+
+                    if key in seen_keys:
+                        # Already found via body — boost with face score
+                        for existing in results:
+                            if existing.get("detection_id") == det_id:
+                                existing["score"] = existing["score"] * 0.3 + face_score * 0.7
+                                existing["match_type"] = "body+face"
+                                break
+                    else:
+                        seen_keys.add(key)
+                        result = {
+                            "type": "detection", "source": "face",
+                            "detection_id": det_id,
+                            "track_id": r.get("track_id"),
+                            "video_id": r.get("video_id"),
+                            "frame_path": r["frame_path"],
+                            "crop_path": r.get("person_crop_path", r.get("crop_path", "")),
+                            "face_crop_path": r.get("crop_path", ""),
+                            "timestamp": r["timestamp"],
+                            "frame_number": r["frame_number"],
+                            "video_filename": r["video_filename"],
+                            "video_path": r["video_path"],
+                            "camera_id": r.get("camera_id"),
+                            "location": r.get("location"),
+                            "recording_start_time": r.get("recording_start_time"),
+                            "timezone": r.get("timezone"),
+                            "class_name": "person",
+                            "confidence": r.get("confidence", 0),
+                            "caption": "face match",
+                            "bbox": None,
+                            "score": face_score * 0.9,  # Face-only match
+                            "match_type": "face",
+                        }
+                        results.append(result)
 
     # Sort by combined score
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -698,9 +739,48 @@ def search_by_person(image: Image.Image, top_k: int = None):
 
 # ---- Helpers ----
 
+# FTS5 treats these as syntax; feeding raw user input causes OperationalError
+# ("no such column", "unterminated string", …). We strip them and quote each
+# surviving token so any character inside becomes a literal.
+_FTS5_STRIP = str.maketrans({
+    '"': " ", "'": " ", "(": " ", ")": " ",
+    "*": " ", ":": " ", "^": " ", "-": " ",
+    "+": " ", "~": " ", "[": " ", "]": " ",
+    "{": " ", "}": " ", "\\": " ",
+    # SQLite treats NUL as C-string terminator; passing it into a bound
+    # parameter raises "unterminated string" before FTS5 even sees the query.
+    "\x00": " ",
+})
+_FTS5_RESERVED = {"and", "or", "not", "near"}
+
+
 def _build_fts_query(query: str) -> str:
-    words = [w for w in query.strip().split() if len(w) > 2]
-    return " OR ".join(words) if words else query
+    """Build a safe FTS5 MATCH query from free-form user text.
+
+    - Strips FTS5 syntax characters (and NUL bytes).
+    - Drops any other ASCII control characters.
+    - Filters out reserved operator words (case-insensitive).
+    - Double-quotes each surviving term so its internal contents are literal.
+    - Falls back to a single quoted phrase (or the empty string) when no
+      usable tokens remain.
+    """
+    if not query:
+        return '""'
+    # Strip control characters first so tokens like ``hello\x01world`` become
+    # ``helloworld`` instead of being kept as-is.
+    cleaned_chars = []
+    for ch in query:
+        if ord(ch) < 32 and ch not in "\t\n\r":
+            continue
+        cleaned_chars.append(ch)
+    cleaned = "".join(cleaned_chars).translate(_FTS5_STRIP)
+    tokens = [t for t in cleaned.split() if len(t) > 2 and t.lower() not in _FTS5_RESERVED]
+    if not tokens:
+        fallback = cleaned.strip()
+        if not fallback:
+            return '""'
+        return '"' + fallback.replace('"', "") + '"'
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def _format_detection_result(row, source="text"):
