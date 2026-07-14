@@ -65,9 +65,16 @@ FACE_REC_DIM = 512 # FaceNet InceptionResnetV1 for identity
 
 # Matching thresholds (Cosine Similarity)
 # Dedicated foundation models are highly sensitive; thresholds are tuned for metric learning spaces.
-PERSON_MATCH_THRESHOLD = 0.72  # DINOv2 body similarity (raised: avoids false positives from similar clothing)
+# Multi-orientation body Re-ID handles rotated queries — thresholds stay strict to avoid false positives.
+PERSON_MATCH_THRESHOLD = 0.72  # DINOv2 body similarity
 FACE_MATCH_THRESHOLD = 0.50    # FaceNet similarity
 BODY_ONLY_DISCOUNT = 0.6       # Discount factor for body-only results (no face confirmation)
+
+# Cross-camera person Re-ID robustness
+PERSON_MULTI_ORIENTATION = True    # Test multiple rotations/flips of the query image
+PERSON_LIGHTING_NORMALIZE = True   # Apply CLAHE normalization for day/night invariance
+PERSON_CLIP_FALLBACK = True        # Also search CLIP general index as safety net
+CLIP_FALLBACK_SCORE_WEIGHT = 0.45  # Weight for CLIP fallback results vs biometric matches
 
 # Lightweight CCTV tracking (groups frame-level detections into event tracks)
 TRACK_IOU_THRESHOLD = 0.25      # Lower values tolerate low-FPS jumps; higher values reduce ID switches

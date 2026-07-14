@@ -581,12 +581,122 @@ def search_by_image(image: Image.Image, top_k: int = None):
     return results[:top_k]
 
 
-def search_by_person(image: Image.Image, top_k: int = None):
+def _generate_query_orientations(image: Image.Image) -> list[Image.Image]:
+    """Generate orientation variants for rotation-invariant matching.
+
+    Covers all 4 rotations × horizontal flip = 8 variants.  This handles
+    ceiling-mounted cameras, rotated phone photos, and mirrored feeds.
     """
-    Search by person photo — find this specific person across all indexed videos.
-    Uses dedicated biometric models for high-accuracy security tracking:
-    1. DINOv2 (Body Re-ID) — mathematically matches clothing/gait patterns.
-    2. FaceNet (Face ID) — matches bone structure and landmarks.
+    flipped = image.transpose(Image.FLIP_LEFT_RIGHT)
+    variants = [
+        image,                                         # Original
+        image.transpose(Image.ROTATE_90),              # 90° CCW
+        image.transpose(Image.ROTATE_180),             # 180°
+        image.transpose(Image.ROTATE_270),             # 270° CCW
+        flipped,                                       # Horizontal mirror
+        flipped.transpose(Image.ROTATE_90),            # Mirror + 90°
+        flipped.transpose(Image.ROTATE_180),           # Mirror + 180°
+        flipped.transpose(Image.ROTATE_270),           # Mirror + 270°
+    ]
+    return variants
+
+
+def _normalize_lighting_cv(img_bgr: np.ndarray) -> np.ndarray:
+    """Apply CLAHE normalization for day/night lighting invariance.
+
+    Converts to LAB color space, equalizes the L (lightness) channel while
+    preserving color information.  Standard preprocessing in surveillance
+    systems — makes a sunlit person produce a similar embedding to the same
+    person under dim streetlights.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def _normalize_lighting_pil(image: Image.Image) -> Image.Image:
+    """PIL wrapper around CLAHE normalization."""
+    cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    normalized = _normalize_lighting_cv(cv_img)
+    return Image.fromarray(cv2.cvtColor(normalized, cv2.COLOR_BGR2RGB))
+
+
+def _search_clip_fallback_person(image: Image.Image, top_k: int,
+                                  seen_keys: set) -> list:
+    """Layer 3: Search the general CLIP index for person-class detections.
+
+    CLIP was trained on 400M image-text pairs and is far more robust to extreme
+    viewpoint and lighting changes than DINOv2.  Results are returned at a lower
+    confidence tier (CLIP_FALLBACK_SCORE_WEIGHT) so they never outrank true
+    biometric matches but still surface the person when all else fails.
+    """
+    results = []
+    index = _load_faiss_index()
+    if index is None or index.ntotal == 0:
+        return results
+
+    try:
+        query_emb = models.encode_images_clip([image])
+        n_candidates = min(
+            max(top_k * config.IMAGE_CANDIDATE_POOL_FACTOR, config.IMAGE_MIN_CANDIDATES),
+            index.ntotal,
+        )
+        scores, indices = index.search(query_emb, n_candidates)
+
+        valid = [(int(indices[0][i]), float(scores[0][i]))
+                 for i in range(len(indices[0]))
+                 if indices[0][i] >= 0 and float(scores[0][i]) >= 0.20]
+
+        if not valid:
+            return results
+
+        faiss_ids = [fid for fid, _ in valid]
+        score_map = {fid: score for fid, score in valid}
+
+        det_results = db.get_detections_by_faiss_ids(faiss_ids)
+        for r in det_results:
+            r = dict(r)  # sqlite3.Row → dict for .get()
+            # Only keep person-class detections
+            if str(r.get("class_name", "")).lower() != "person":
+                continue
+            key = f"person_{r['id']}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            result = _format_detection_result(r, source="clip_fallback")
+            raw_score = score_map.get(r.get("faiss_id"), 0)
+            result["score"] = raw_score * config.CLIP_FALLBACK_SCORE_WEIGHT
+            result["match_type"] = "visual"
+            results.append(result)
+
+        print(f"[search] CLIP fallback: {len(results)} person matches")
+    except Exception as e:
+        print(f"[search] CLIP fallback error: {e}")
+
+    return results
+
+
+def search_by_person(image: Image.Image, top_k: int = None):
+    """Search by person photo — find this specific person across all indexed videos.
+
+    3-Layer cross-camera strategy for real security scenarios
+    (phone photo → CCTV match across different cameras/angles/lighting):
+
+    Layer 1: Multi-Orientation — tests 8 rotated/flipped variants of the query
+             to handle ceiling mounts, rotated feeds, different phone angles.
+    Layer 2: CLAHE Lighting Normalization — equalizes brightness so a daylight
+             phone photo matches the same person in dark nighttime CCTV.
+    Layer 3: CLIP Fallback — searches the general CLIP visual index for
+             person-class matches as a safety net when biometric models fail
+             due to extreme viewpoint/resolution differences.
+
+    Biometric models used:
+    1. DINOv2 (Body Re-ID) — matches clothing, build, and gait patterns.
+    2. FaceNet (Face ID) — matches bone structure and facial landmarks.
+
+    Score hierarchy:  face+body > face > body > CLIP visual
     """
     if top_k is None:
         top_k = config.DEFAULT_TOP_K
@@ -594,137 +704,200 @@ def search_by_person(image: Image.Image, top_k: int = None):
     seen_keys = set()
     results = []
 
-    import cv2 as cv2_local
-    cv_img = cv2_local.cvtColor(np.array(image), cv2_local.COLOR_RGB2BGR)
+    # ------------------------------------------------------------------
+    # Build query variants (Layer 1 + Layer 2)
+    # ------------------------------------------------------------------
+    if getattr(config, "PERSON_MULTI_ORIENTATION", False):
+        orientations = _generate_query_orientations(image)
+        print(f"[search] Multi-orientation: {len(orientations)} variants")
+    else:
+        orientations = [image]
+
+    # For each orientation, optionally create a CLAHE-normalized copy
+    query_variants = []  # list of (PIL image, label)
+    for i, orient_img in enumerate(orientations):
+        query_variants.append((orient_img, f"orient_{i}"))
+        if getattr(config, "PERSON_LIGHTING_NORMALIZE", False):
+            query_variants.append((_normalize_lighting_pil(orient_img), f"orient_{i}_clahe"))
+
+    print(f"[search] Total query variants: {len(query_variants)} "
+          f"(orientations={'on' if len(orientations) > 1 else 'off'}, "
+          f"CLAHE={'on' if getattr(config, 'PERSON_LIGHTING_NORMALIZE', False) else 'off'})")
+
+    # ------------------------------------------------------------------
+    # Detect face — ONLY on the original uploaded image (orient_0).
+    #
+    # YOLO-Face and FaceNet are trained on upright, properly-oriented
+    # faces. Running them on ANY rotated/flipped variant produces false
+    # face detections from body textures and clothing patterns. FaceNet
+    # then encodes these garbage crops into embeddings that match wrong
+    # people with HIGH confidence, poisoning the results.
+    #
+    # Strategy: Face matching works on the image AS UPLOADED.
+    # All 8 rotated variants are handled by DINOv2 body Re-ID only.
+    # ------------------------------------------------------------------
+    face_variants = []  # list of (cv_img_bgr, face_bbox, is_face_crop, variant_label)
+
+    # Only process the original orientation for face detection
+    original_pil = query_variants[0][0]  # orient_0
+    cv_img = cv2.cvtColor(np.array(original_pil), cv2.COLOR_RGB2BGR)
     h, w = cv_img.shape[:2]
     img_area = h * w
 
-    # Detect and encode face identity using FaceNet
-    query_face_emb = None
     faces = models.detect_faces(cv_img)
-
-    is_face_crop = False
-    best_bbox = None
-
     if faces:
         best_face = max(faces, key=lambda f: (f["bbox"][2]-f["bbox"][0]) * (f["bbox"][3]-f["bbox"][1]))
         best_bbox = best_face["bbox"]
         face_area = (best_bbox[2]-best_bbox[0]) * (best_bbox[3]-best_bbox[1])
-        if face_area > 0.4 * img_area:
-            is_face_crop = True
+        is_face_crop = face_area > 0.4 * img_area
+        face_variants.append((cv_img, best_bbox, is_face_crop, "orient_0"))
         print(f"[search] Face detected in query image (conf: {best_face['confidence']:.2f})")
 
-        # Only run FaceNet when a face was actually detected — running it on non-face
-        # imagery produces meaningless embeddings that pollute the face index recall.
-        query_face_emb = models.encode_face_identity(cv_img, best_bbox)
-        if np.all(query_face_emb == 0):
-            query_face_emb = None
-        else:
-            query_face_emb = query_face_emb.reshape(1, -1)
+        # Also try CLAHE-normalized version for lighting-invariant face encoding
+        if getattr(config, "PERSON_LIGHTING_NORMALIZE", False):
+            clahe_cv = _normalize_lighting_cv(cv_img)
+            face_variants.append((clahe_cv, best_bbox, is_face_crop, "orient_0_clahe"))
     else:
-        print("[search] No face detected by YOLO in query image; skipping FaceNet stage.")
+        print("[search] No face detected in original query image.")
 
-    # Encode with DINOv2 (Biometric Re-ID) ONLY if it's not a tight face crop
-    query_emb = None
-    if not is_face_crop:
-        print("[search] Query image contains a body. Running DINOv2 Re-ID.")
-        query_emb = models.encode_person_reid([image])
-    else:
-        print("[search] Query image is a tight face crop. Disabling Body Re-ID to prevent inaccurate clothing matches.")
+    print(f"[search] Faces detected in {len(face_variants)}/{len(query_variants)} variants")
 
-    # --- Stage 1: Person Re-ID Index ---
-    if query_emb is not None:
-        person_index = _get_cached_faiss(config.PERSON_FAISS_INDEX_PATH)
-        if person_index is not None and person_index.ntotal > 0:
-            n_candidates = min(
-                max(top_k * config.PERSON_CANDIDATE_POOL_FACTOR, config.PERSON_MIN_CANDIDATES),
-                person_index.ntotal,
-            )
+    # Determine if the original query is a tight face crop (skip body Re-ID)
+    original_is_face_crop = False
+    if face_variants:
+        # Check if the original (first) orientation is a face crop
+        for cv_img, bbox, is_face_crop, label in face_variants:
+            if label == "orient_0":
+                original_is_face_crop = is_face_crop
+                break
+
+    # ------------------------------------------------------------------
+    # Stage 1: DINOv2 Body Re-ID across all orientations (batch-encoded)
+    # ------------------------------------------------------------------
+    person_index = _get_cached_faiss(config.PERSON_FAISS_INDEX_PATH)
+
+    if not original_is_face_crop and person_index is not None and person_index.ntotal > 0:
+        # Batch-encode ALL variants with DINOv2 in a single GPU call
+        body_images = [img for img, _ in query_variants]
+        body_embeddings = models.encode_person_reid(body_images)
+
+        n_candidates = min(
+            max(top_k * config.PERSON_CANDIDATE_POOL_FACTOR, config.PERSON_MIN_CANDIDATES),
+            person_index.ntotal,
+        )
+
+        # Search with EACH embedding and collect best score per FAISS ID
+        best_scores = {}  # faiss_id → best_score
+        for emb_idx in range(len(body_embeddings)):
+            query_emb = body_embeddings[emb_idx:emb_idx+1]
             scores, indices = person_index.search(query_emb, n_candidates)
-            
-            valid = [(int(indices[0][i]), float(scores[0][i]))
-                     for i in range(len(indices[0]))
-                     if indices[0][i] >= 0 and float(scores[0][i]) >= config.PERSON_MATCH_THRESHOLD]
-            
-            print(f"[search] Person Re-ID: {len(valid)} matches (threshold {config.PERSON_MATCH_THRESHOLD})")
-            
-            if valid:
-                faiss_ids = [fid for fid, _ in valid]
-                score_map = {fid: score for fid, score in valid}
-                
-                person_results = db.get_persons_by_faiss_ids(faiss_ids)
-                for r in person_results:
-                    key = f"person_{r['id']}"
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        result = _format_detection_result(r, source="person_reid")
-                        # Body-only scores are discounted so they never outrank
-                        # face-confirmed results — clothing is not identity.
-                        raw_score = score_map.get(r["person_faiss_id"], 0)
-                        result["score"] = raw_score * config.BODY_ONLY_DISCOUNT
-                        result["match_type"] = "body"
-                        results.append(result)
 
-    # --- Stage 2: Face Index ---
-    if query_face_emb is not None:
-        face_index = _get_cached_faiss(config.FACE_FAISS_INDEX_PATH)
-        if face_index is not None and face_index.ntotal > 0:
-            n_candidates = min(
-                max(top_k * config.FACE_CANDIDATE_POOL_FACTOR, config.FACE_MIN_CANDIDATES),
-                face_index.ntotal,
-            )
+            for i in range(len(indices[0])):
+                fid = int(indices[0][i])
+                score = float(scores[0][i])
+                if fid >= 0 and score >= config.PERSON_MATCH_THRESHOLD:
+                    if fid not in best_scores or score > best_scores[fid]:
+                        best_scores[fid] = score
+
+        print(f"[search] Person Re-ID (multi-orient): {len(best_scores)} unique matches "
+              f"(threshold {config.PERSON_MATCH_THRESHOLD})")
+
+        if best_scores:
+            faiss_ids = list(best_scores.keys())
+            person_results = db.get_persons_by_faiss_ids(faiss_ids)
+            for r in person_results:
+                key = f"person_{r['id']}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    result = _format_detection_result(r, source="person_reid")
+                    raw_score = best_scores.get(r["person_faiss_id"], 0)
+                    result["score"] = raw_score * config.BODY_ONLY_DISCOUNT
+                    result["match_type"] = "body"
+                    results.append(result)
+    elif original_is_face_crop:
+        print("[search] Query is a tight face crop. Skipping Body Re-ID.")
+    else:
+        print("[search] Person FAISS index empty or missing. Skipping Body Re-ID.")
+
+    # ------------------------------------------------------------------
+    # Stage 2: FaceNet across face-detected orientations
+    # ------------------------------------------------------------------
+    face_index = _get_cached_faiss(config.FACE_FAISS_INDEX_PATH)
+
+    if face_variants and face_index is not None and face_index.ntotal > 0:
+        n_candidates = min(
+            max(top_k * config.FACE_CANDIDATE_POOL_FACTOR, config.FACE_MIN_CANDIDATES),
+            face_index.ntotal,
+        )
+
+        # Collect best face scores across all orientations
+        best_face_scores = {}  # faiss_id → best_score
+        for cv_img, best_bbox, _, label in face_variants:
+            query_face_emb = models.encode_face_identity(cv_img, best_bbox)
+            if np.all(query_face_emb == 0):
+                continue
+            query_face_emb = query_face_emb.reshape(1, -1)
+
             scores, indices = face_index.search(query_face_emb, n_candidates)
+            for i in range(len(indices[0])):
+                fid = int(indices[0][i])
+                score = float(scores[0][i])
+                if fid >= 0 and score >= config.FACE_MATCH_THRESHOLD:
+                    if fid not in best_face_scores or score > best_face_scores[fid]:
+                        best_face_scores[fid] = score
 
-            valid = [(int(indices[0][i]), float(scores[0][i]))
-                     for i in range(len(indices[0]))
-                     if indices[0][i] >= 0 and float(scores[0][i]) >= config.FACE_MATCH_THRESHOLD]
+        print(f"[search] Face match (multi-orient): {len(best_face_scores)} unique matches "
+              f"(threshold {config.FACE_MATCH_THRESHOLD})")
 
-            print(f"[search] Face match: {len(valid)} matches (threshold {config.FACE_MATCH_THRESHOLD})")
+        if best_face_scores:
+            faiss_ids = list(best_face_scores.keys())
+            face_results = db.get_faces_by_faiss_ids(faiss_ids)
+            for r in face_results:
+                r = dict(r)  # sqlite3.Row → dict for .get()
+                det_id = r["detection_id"]
+                key = f"person_{det_id}"
+                face_score = best_face_scores.get(r["face_faiss_id"], 0)
 
-            if valid:
-                faiss_ids = [fid for fid, _ in valid]
-                score_map = {fid: score for fid, score in valid}
+                if key in seen_keys:
+                    # Already found via body — boost with face score
+                    for existing in results:
+                        if existing.get("detection_id") == det_id:
+                            existing["score"] = existing["score"] * 0.3 + face_score * 0.7
+                            existing["match_type"] = "body+face"
+                            break
+                else:
+                    seen_keys.add(key)
+                    result = {
+                        "type": "detection", "source": "face",
+                        "detection_id": det_id,
+                        "track_id": r.get("track_id"),
+                        "video_id": r.get("video_id"),
+                        "frame_path": r["frame_path"],
+                        "crop_path": r.get("person_crop_path", r.get("crop_path", "")),
+                        "face_crop_path": r.get("crop_path", ""),
+                        "timestamp": r["timestamp"],
+                        "frame_number": r["frame_number"],
+                        "video_filename": r["video_filename"],
+                        "video_path": r["video_path"],
+                        "camera_id": r.get("camera_id"),
+                        "location": r.get("location"),
+                        "recording_start_time": r.get("recording_start_time"),
+                        "timezone": r.get("timezone"),
+                        "class_name": "person",
+                        "confidence": r.get("confidence", 0),
+                        "caption": "face match",
+                        "bbox": None,
+                        "score": face_score * 0.9,  # Face-only match
+                        "match_type": "face",
+                    }
+                    results.append(result)
 
-                face_results = db.get_faces_by_faiss_ids(faiss_ids)
-                for r in face_results:
-                    r = dict(r)  # sqlite3.Row → dict for .get()
-                    det_id = r["detection_id"]
-                    key = f"person_{det_id}"
-                    face_score = score_map.get(r["face_faiss_id"], 0)
-
-                    if key in seen_keys:
-                        # Already found via body — boost with face score
-                        for existing in results:
-                            if existing.get("detection_id") == det_id:
-                                existing["score"] = existing["score"] * 0.3 + face_score * 0.7
-                                existing["match_type"] = "body+face"
-                                break
-                    else:
-                        seen_keys.add(key)
-                        result = {
-                            "type": "detection", "source": "face",
-                            "detection_id": det_id,
-                            "track_id": r.get("track_id"),
-                            "video_id": r.get("video_id"),
-                            "frame_path": r["frame_path"],
-                            "crop_path": r.get("person_crop_path", r.get("crop_path", "")),
-                            "face_crop_path": r.get("crop_path", ""),
-                            "timestamp": r["timestamp"],
-                            "frame_number": r["frame_number"],
-                            "video_filename": r["video_filename"],
-                            "video_path": r["video_path"],
-                            "camera_id": r.get("camera_id"),
-                            "location": r.get("location"),
-                            "recording_start_time": r.get("recording_start_time"),
-                            "timezone": r.get("timezone"),
-                            "class_name": "person",
-                            "confidence": r.get("confidence", 0),
-                            "caption": "face match",
-                            "bbox": None,
-                            "score": face_score * 0.9,  # Face-only match
-                            "match_type": "face",
-                        }
-                        results.append(result)
+    # ------------------------------------------------------------------
+    # Stage 3: CLIP Fallback (Layer 3 — catches extreme viewpoint changes)
+    # ------------------------------------------------------------------
+    if getattr(config, "PERSON_CLIP_FALLBACK", False):
+        clip_results = _search_clip_fallback_person(image, top_k, seen_keys)
+        results.extend(clip_results)
 
     # Sort by combined score
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
