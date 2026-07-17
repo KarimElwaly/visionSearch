@@ -38,8 +38,14 @@ def _load_clip():
         from transformers import CLIPModel, CLIPProcessor
         device = _get_device()
         print(f"[models] Loading CLIP model to {device}: {config.CLIP_MODEL_NAME}")
-        _clip_processor = CLIPProcessor.from_pretrained(config.CLIP_MODEL_NAME)
-        _clip_model = CLIPModel.from_pretrained(config.CLIP_MODEL_NAME).to(device)
+        # Try online first, fall back to local cache if network is unavailable
+        try:
+            _clip_processor = CLIPProcessor.from_pretrained(config.CLIP_MODEL_NAME)
+            _clip_model = CLIPModel.from_pretrained(config.CLIP_MODEL_NAME).to(device)
+        except (OSError, Exception) as e:
+            print(f"[models] Online load failed ({type(e).__name__}), using local cache...")
+            _clip_processor = CLIPProcessor.from_pretrained(config.CLIP_MODEL_NAME, local_files_only=True)
+            _clip_model = CLIPModel.from_pretrained(config.CLIP_MODEL_NAME, local_files_only=True).to(device)
         if device == "cuda":
             _clip_model = _clip_model.half()
         _clip_model.eval()
@@ -148,8 +154,9 @@ def _load_yolo():
     if _yolo_model is None:
         from ultralytics import YOLO
         print(f"[models] Loading YOLO model: {config.YOLO_MODEL_PATH}")
-        _yolo_model = YOLO(config.YOLO_MODEL_PATH)
-        print("[models] YOLO model loaded.")
+        device = _get_device()
+        _yolo_model = YOLO(config.YOLO_MODEL_PATH).to(device)
+        print(f"[models] YOLO model loaded to {device}.")
     return _yolo_model
 
 
@@ -185,8 +192,9 @@ def detect_objects_batch(frames_bgr: list) -> list:
     """
     model = _load_yolo()
     if not frames_bgr: return []
-    # stream=True is more memory efficient for large batches
-    results = model(frames_bgr, conf=config.YOLO_CONFIDENCE, classes=config.YOLO_CLASSES, half=True, verbose=False, stream=True)
+    # stream=False is REQUIRED for batch inference. stream=True forces sequential processing!
+    # Explicitly setting batch size is REQUIRED to prevent Ultralytics from defaulting to batch=1
+    results = model(frames_bgr, conf=config.YOLO_CONFIDENCE, classes=config.YOLO_CLASSES, half=True, verbose=False, stream=False, batch=len(frames_bgr))
     batch_dets = []
     for r in results:
         dets = []
@@ -216,8 +224,9 @@ def _load_yolo_face():
             print("[models] Face detection disabled. Download yolo11n-face.pt to enable.")
             return None
         print(f"[models] Loading YOLO-Face model: {config.YOLO_FACE_MODEL_PATH}")
-        _yolo_face_model = YOLO(config.YOLO_FACE_MODEL_PATH)
-        print("[models] YOLO-Face model loaded.")
+        device = _get_device()
+        _yolo_face_model = YOLO(config.YOLO_FACE_MODEL_PATH).to(device)
+        print(f"[models] YOLO-Face model loaded to {device}.")
     return _yolo_face_model
 
 
@@ -252,7 +261,8 @@ def detect_faces_batch(frames_bgr: list) -> list:
     model = _load_yolo_face()
     if model is None or not frames_bgr: return [[] for _ in frames_bgr]
     try:
-        results = model(frames_bgr, conf=config.FACE_DETECTION_CONFIDENCE, half=True, verbose=False, stream=True)
+        # stream=False and explicit batch=len(frames_bgr) to allow true tensor batching
+        results = model(frames_bgr, conf=config.FACE_DETECTION_CONFIDENCE, half=True, verbose=False, stream=False, batch=len(frames_bgr))
         batch_faces = []
         for r in results:
             faces = []
@@ -268,54 +278,89 @@ def detect_faces_batch(frames_bgr: list) -> list:
         return [[] for _ in frames_bgr]
 
 
-# ---- Biometric Re-ID (Body Appearance) ----
+# ---- Biometric Re-ID (Body Appearance via OSNet) ----
 
-_dinov2_model = None
+_osnet_session = None
+
+def _load_osnet():
+    global _osnet_session
+    if _osnet_session is None:
+        import onnxruntime as ort
+        import os
+        from huggingface_hub import hf_hub_download
+        
+        # Download dynamic batch OSNet ONNX if not present
+        save_dir = os.path.join(os.path.dirname(__file__), "models")
+        os.makedirs(save_dir, exist_ok=True)
+        onnx_path = os.path.join(save_dir, "osnet_x0_25_msmt17_dynamic.onnx")
+        
+        if not os.path.exists(onnx_path):
+            print("[models] Downloading OSNet Re-ID ONNX model (first time only)...")
+            import onnx
+            raw_path = hf_hub_download(repo_id="anriha/osnet_x0_25_msmt17", filename="osnet_x0_25_msmt17.onnx")
+            model = onnx.load(raw_path)
+            model.graph.input[0].type.tensor_type.shape.dim[0].dim_param = 'batch_size'
+            for output in model.graph.output:
+                output.type.tensor_type.shape.dim[0].dim_param = 'batch_size'
+            onnx.save(model, onnx_path)
+
+        # Prefer GPU if onnxruntime-gpu is installed, fall back to CPU
+        available = ort.get_available_providers()
+        if 'CUDAExecutionProvider' in available:
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            print("[models] Loading OSNet Re-ID via ONNX Runtime (CUDA GPU)...")
+        else:
+            providers = ['CPUExecutionProvider']
+            print("[models] Loading OSNet Re-ID via ONNX Runtime (CPU)...")
+        _osnet_session = ort.InferenceSession(onnx_path, providers=providers)
+        active = _osnet_session.get_providers()
+        print(f"[models] OSNet loaded. Active providers: {active}")
+    return _osnet_session
 
 
-def _load_dinov2():
-    global _dinov2_model
-    if _dinov2_model is None:
-        import torch
-        device = _get_device()
-        print(f"[models] Loading DINOv2 to {device}: {config.REID_MODEL_NAME}")
-        # Use torch.hub to load DINOv2 (pure PyTorch Foundation Model)
-        _dinov2_model = torch.hub.load('facebookresearch/dinov2', config.REID_MODEL_NAME)
-        _dinov2_model = _dinov2_model.to(device)
-        if device == "cuda":
-            _dinov2_model = _dinov2_model.half()
-        _dinov2_model.eval()
-        print("[models] DINOv2 loaded (FP16).")
-    return _dinov2_model
+def _preprocess_osnet_numpy(pil_img):
+    """Preprocess a PIL image for OSNet using pure numpy/OpenCV (no torch)."""
+    import cv2
+    # Convert PIL to numpy RGB, then resize to 256x128 (HxW)
+    img = np.array(pil_img)
+    if img.ndim == 2:  # grayscale
+        img = np.stack([img]*3, axis=-1)
+    img = cv2.resize(img, (128, 256))  # (W, H) for cv2
+    # Convert to float32 [0,1], then normalize with ImageNet stats
+    img = img.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img = (img - mean) / std
+    # HWC -> CHW
+    return img.transpose(2, 0, 1)
 
 
 def encode_person_reid(images: list) -> np.ndarray:
-    """Encode person crops with DINOv2 (True visual Re-ID). Fully batched."""
-    import torch
-    from torchvision import transforms
-    model = _load_dinov2()
-    if model is None or not images:
+    """Encode person crops with OSNet (Specialized surveillance Re-ID). Fully batched.
+    
+    Uses pure numpy/OpenCV preprocessing (no torch dependency) for speed.
+    """
+    session = _load_osnet()
+    if session is None or not images:
         return np.zeros((len(images), config.REID_DIM), dtype="float32")
 
-    device = _get_device()
-    # DINOv2 standard preprocessing requires multiple of 14 for patch size
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    # Batch preprocess + chunked forward pass for GPU OOM safety
-    tensors = [preprocess(img) for img in images]
+    # Batch preprocess with pure numpy (3x faster than torchvision)
+    preprocessed = [_preprocess_osnet_numpy(img) for img in images]
     out = np.zeros((len(images), config.REID_DIM), dtype="float32")
-    batch_size = 32
-    for i in range(0, len(tensors), batch_size):
-        batch = torch.stack(tensors[i:i + batch_size]).to(device)
-        with torch.no_grad():
-            with _autocast():
-                feats = model(batch)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        out[i:i + batch.shape[0]] = feats.cpu().float().numpy()
+    batch_size = 64  # Larger batch for GPU throughput
+    
+    input_name = session.get_inputs()[0].name
+    
+    for i in range(0, len(preprocessed), batch_size):
+        batch = np.stack(preprocessed[i:i + batch_size]).astype(np.float32)
+        # ONNX inference (GPU or CPU depending on provider)
+        feats = session.run(None, {input_name: batch})[0]
+        # L2 normalize
+        norms = np.linalg.norm(feats, axis=-1, keepdims=True)
+        norms[norms == 0] = 1.0
+        feats = feats / norms
+        out[i:i + batch.shape[0]] = feats
+        
     return out
 
 

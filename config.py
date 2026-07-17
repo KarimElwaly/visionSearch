@@ -55,20 +55,21 @@ YOLO_WORLD_CONFIDENCE = 0.15
 # CLIP model — ViT-L/14 is much better at colors, clothing, fine-grained attributes
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 CLIP_DIM = 768  # ViT-L/14 uses 768-dim embeddings (ViT-B/32 was 512)
-CLIP_BATCH_SIZE = 16  # Smaller batch for larger model
+CLIP_BATCH_SIZE = 16  # ViT-L/14 in FP16: 16 images saturates ~3.5GB of 6GB VRAM safely
 CLIP_MEGA_BATCH = 64  # Increased to 64: forces the GPU to solve 64 frames/faces simultaneously to max out 6GB VRAM
 
 # Dedicated Biometric Models — Pure PyTorch (C++ Free)
-REID_MODEL_NAME = "dinov2_vits14" # DINOv2 ViT-Small for body Re-ID
-REID_DIM = 384
+REID_MODEL_NAME = "osnet_x0_25_msmt17" # Replaced DINOv2 with OSNet for specialized tracking
+REID_DIM = 512
 FACE_REC_DIM = 512 # FaceNet InceptionResnetV1 for identity
 
 # Matching thresholds (Cosine Similarity)
-# Dedicated foundation models are highly sensitive; thresholds are tuned for metric learning spaces.
-# Multi-orientation body Re-ID handles rotated queries — thresholds stay strict to avoid false positives.
-PERSON_MATCH_THRESHOLD = 0.72  # DINOv2 body similarity
+# OSNet similarity threshold is generally lower than DINOv2 because it isolates features
+PERSON_MATCH_THRESHOLD = 0.50  # OSNet strict similarity (lowered for same-clothes)
+PERSON_MATCH_THRESHOLD_RELAXED = 0.45  # OSNet relaxed for cross-camera
 FACE_MATCH_THRESHOLD = 0.50    # FaceNet similarity
-BODY_ONLY_DISCOUNT = 0.6       # Discount factor for body-only results (no face confirmation)
+BODY_ONLY_DISCOUNT = 0.95      # High confidence in clothing matches even without faces
+BODY_ROTATED_DISCOUNT = 0.35   # Heavy discount for matches found only via rotated orientations
 
 # Cross-camera person Re-ID robustness
 PERSON_MULTI_ORIENTATION = True    # Test multiple rotations/flips of the query image

@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
         models._load_clip()
         models._load_yolo()
         models._load_yolo_face()
-        models._load_dinov2()
+        models._load_osnet()
         models._load_facenet()
         searcher._load_yolo_world()
 

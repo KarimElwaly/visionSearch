@@ -791,16 +791,21 @@ def search_by_person(image: Image.Image, top_k: int = None):
         for emb_idx in range(len(body_embeddings)):
             query_emb = body_embeddings[emb_idx:emb_idx+1]
             scores, indices = person_index.search(query_emb, n_candidates)
+            
+            # Determine if this is the original orientation (first two in the list: orient_0 + clahe)
+            is_original = (emb_idx < 2)
+            threshold = config.PERSON_MATCH_THRESHOLD if is_original else config.PERSON_MATCH_THRESHOLD_RELAXED
+            discount = 1.0 if is_original else config.BODY_ROTATED_DISCOUNT
 
             for i in range(len(indices[0])):
                 fid = int(indices[0][i])
                 score = float(scores[0][i])
-                if fid >= 0 and score >= config.PERSON_MATCH_THRESHOLD:
-                    if fid not in best_scores or score > best_scores[fid]:
-                        best_scores[fid] = score
+                if fid >= 0 and score >= threshold:
+                    discounted_score = score * discount
+                    if fid not in best_scores or discounted_score > best_scores[fid]:
+                        best_scores[fid] = discounted_score
 
-        print(f"[search] Person Re-ID (multi-orient): {len(best_scores)} unique matches "
-              f"(threshold {config.PERSON_MATCH_THRESHOLD})")
+        print(f"[search] Person Re-ID (multi-orient): {len(best_scores)} unique matches")
 
         if best_scores:
             faiss_ids = list(best_scores.keys())
@@ -898,6 +903,15 @@ def search_by_person(image: Image.Image, top_k: int = None):
     if getattr(config, "PERSON_CLIP_FALLBACK", False):
         clip_results = _search_clip_fallback_person(image, top_k, seen_keys)
         results.extend(clip_results)
+
+    # ------------------------------------------------------------------
+    # Stage 4: Color-Aware Re-ranking ("Same Clothes" Maximization)
+    # ------------------------------------------------------------------
+    # If the user provided a full body image, color (clothing) is the most
+    # reliable feature for tracking the exact same person across cameras.
+    if not original_is_face_crop and results:
+        # High weight (0.75) to aggressively prioritize clothing color (same clothes)
+        results = _rerank_by_color(results, image, weight=0.75)
 
     # Sort by combined score
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
