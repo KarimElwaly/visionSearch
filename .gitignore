@@ -13,3 +13,18 @@ dist/
 *.egg-info/
 .vscode/
 .idea/
+
+# Data backups and caches
+data_backup/
+
+# Video and large media files
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Models and checkpoints
+models/
+*.onnx
+*.pt
+*.bin
