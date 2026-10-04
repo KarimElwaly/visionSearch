@@ -13,7 +13,10 @@ Stage 3: VLM Verification (optional, ~5-10 seconds)
   → Adds rich text captions for display
 """
 import os
+import json
 import threading
+import time
+from functools import wraps
 import numpy as np
 import faiss
 from PIL import Image
@@ -76,13 +79,33 @@ def _load_faiss_index():
 # ---- YOLO-World for open-vocabulary re-ranking ----
 
 _yolo_world_model = None
+_yolo_world_device = "cpu"
 _image_search_yolo = None  # cached base YOLO for search_by_image object cropping
+_YOLO_WORLD_LOCK = threading.Lock()
+
+
+def _timed_operation(name: str):
+    """Log one machine-readable end-to-end latency record per operation."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                timing = {
+                    "operation": name,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                }
+                print(f"[search][timing] {json.dumps(timing, sort_keys=True)}")
+        return wrapper
+    return decorator
 
 
 def _load_image_search_yolo():
     """Cached base YOLO detector used by search_by_image to crop the primary object.
 
-    Runs on CPU to keep GPU memory free for CLIP / DINOv2 / FaceNet.
+    Runs on CPU to keep GPU memory free for CLIP / OSNet / FaceNet.
     """
     global _image_search_yolo
     if _image_search_yolo is None:
@@ -94,28 +117,64 @@ def _load_image_search_yolo():
 
 
 def _load_yolo_world():
-    global _yolo_world_model
+    global _yolo_world_model, _yolo_world_device
     if _yolo_world_model is None:
         from ultralytics import YOLO
         import clip as clip_pkg
+        import torch
         model_path = config.YOLO_WORLD_MODEL_PATH
         print(f"[search] Loading YOLO-World: {model_path}")
         _yolo_world_model = YOLO(model_path)
-        _yolo_world_model.to("cpu")
+        requested_device = str(getattr(config, "YOLO_WORLD_DEVICE", "auto")).lower()
+        target_device = "cuda" if requested_device == "auto" and torch.cuda.is_available() else requested_device
+        if target_device not in {"cpu", "cuda"}:
+            target_device = requested_device
+
+        try:
+            _yolo_world_model.to(target_device)
+            _yolo_world_device = target_device
+        except Exception as exc:
+            print(f"[search] YOLO-World could not use {target_device}: {exc}; falling back to CPU")
+            _yolo_world_model.to("cpu")
+            _yolo_world_device = "cpu"
+
         # Pre-load YOLO-World's internal CLIP text encoder on CPU
-        # (set_classes uses clip.load() which defaults to CUDA and crashes)
+        # so dynamic query classes do not consume additional GPU memory.
         clip_model, _ = clip_pkg.load("ViT-B/32", device="cpu")
         _yolo_world_model.model.clip = clip_model
-        print("[search] YOLO-World loaded (CPU).")
+        print(f"[search] YOLO-World loaded ({_yolo_world_device}).")
+
+        if getattr(config, "YOLO_WORLD_WARMUP", True):
+            try:
+                _yolo_world_model.set_classes(["person"])
+                dummy_frame = np.zeros((config.YOLO_WORLD_IMAGE_SIZE, config.YOLO_WORLD_IMAGE_SIZE, 3), dtype=np.uint8)
+                _yolo_world_model(
+                    [dummy_frame],
+                    conf=config.YOLO_WORLD_CONFIDENCE,
+                    imgsz=config.YOLO_WORLD_IMAGE_SIZE,
+                    batch=1,
+                    device=_yolo_world_device,
+                    verbose=False,
+                )
+                print(f"[search] YOLO-World warmup complete ({_yolo_world_device}).")
+            except Exception as exc:
+                if _yolo_world_device != "cpu":
+                    print(f"[search] YOLO-World GPU warmup failed: {exc}; falling back to CPU")
+                    _yolo_world_model.to("cpu")
+                    _yolo_world_device = "cpu"
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
     return _yolo_world_model
 
 
+@_timed_operation("yolo_world_rerank")
 def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
     """
     Stage 2: Re-rank candidates using YOLO-World open-vocabulary detection.
     Uses the FULL query as the detection class (not individual words).
     "white jacket" → detects white jackets, NOT any jacket.
     """
+    global _yolo_world_device
     try:
         model = _load_yolo_world()
     except Exception as e:
@@ -132,67 +191,93 @@ def _rerank_with_yolo_world(candidates: list, query: str, top_k: int) -> list:
     if core_nouns and core_nouns[-1] != query.strip():
         query_classes.append(core_nouns[-1])
 
-    try:
-        model.set_classes(query_classes)
-    except Exception as e:
-        print(f"[search] YOLO-World set_classes failed: {e}, skipping re-ranking")
-        return candidates
-    
-    print(f"[search] YOLO-World classes: {query_classes}")
-
+    # Multiple detection candidates often point to the same full frame. Infer
+    # each unique frame once, then reuse its open-vocabulary result.
+    candidates_by_path = {}
     for candidate in candidates:
-        # Always run YOLO-World on the full frame — the query object may be
-        # anywhere in the scene, not necessarily inside a tiny person crop.
-        # (Previously used crop_path for detection results, which killed recall
-        # for scene-object queries like "ring", "bag", "hat".)
         target_path = candidate.get("frame_path") or candidate.get("crop_path", "")
-        if not target_path or not os.path.exists(target_path):
-            continue
+        if target_path and os.path.exists(target_path):
+            candidates_by_path.setdefault(target_path, []).append(candidate)
 
-        try:
-            frame = cv2.imread(target_path)
-            if frame is None:
+    paths = list(candidates_by_path)
+    batch_size = max(1, int(getattr(config, "YOLO_WORLD_BATCH_SIZE", 8)))
+    image_size = int(getattr(config, "YOLO_WORLD_IMAGE_SIZE", 640))
+    inference_by_path = {}
+
+    def run_batches(device: str) -> dict:
+        results_by_path = {}
+        for start in range(0, len(paths), batch_size):
+            batch_paths = paths[start:start + batch_size]
+            batch_frames = []
+            loaded_paths = []
+            for path in batch_paths:
+                frame = cv2.imread(path)
+                if frame is not None:
+                    batch_frames.append(frame)
+                    loaded_paths.append(path)
+
+            if not batch_frames:
                 continue
 
-            # Search with stricter confidence threshold (0.15 instead of 0.10)
-            results = model(frame, conf=config.YOLO_WORLD_CONFIDENCE, verbose=False)
-            
-            # Count detections and get max confidence
-            max_conf = 0.0
-            det_count = 0
-            best_class_idx = -1
-            
-            for r in results:
-                for box in r.boxes:
+            batch_results = model(
+                batch_frames,
+                conf=config.YOLO_WORLD_CONFIDENCE,
+                imgsz=image_size,
+                batch=len(batch_frames),
+                device=device,
+                verbose=False,
+            )
+            for path, result in zip(loaded_paths, batch_results):
+                max_conf = 0.0
+                det_count = 0
+                best_class_idx = -1
+                for box in result.boxes:
                     det_count += 1
-                    conf = float(box.conf[0])
-                    cls_idx = int(box.cls[0])
-                    if conf > max_conf:
-                        max_conf = conf
-                        best_class_idx = cls_idx
+                    confidence = float(box.conf[0])
+                    if confidence > max_conf:
+                        max_conf = confidence
+                        best_class_idx = int(box.cls[0])
+                results_by_path[path] = (det_count, max_conf, best_class_idx)
+        return results_by_path
 
-            # Boost score based on YOLO-World detections
+    # set_classes mutates shared model state, so keep class selection and all
+    # corresponding inference together when concurrent searches arrive.
+    try:
+        with _YOLO_WORLD_LOCK:
+            model.set_classes(query_classes)
+            print(f"[search] YOLO-World classes: {query_classes}")
+            try:
+                inference_by_path = run_batches(_yolo_world_device)
+            except Exception as gpu_exc:
+                if _yolo_world_device == "cpu":
+                    raise
+                print(f"[search] YOLO-World GPU inference failed: {gpu_exc}; retrying on CPU")
+                model.to("cpu")
+                _yolo_world_device = "cpu"
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                inference_by_path = run_batches("cpu")
+    except Exception as e:
+        print(f"[search] YOLO-World batch inference failed: {e}, skipping re-ranking")
+        return candidates[:top_k]
+
+    for path, path_candidates in candidates_by_path.items():
+        det_count, max_conf, best_class_idx = inference_by_path.get(path, (0, 0.0, -1))
+        for candidate in path_candidates:
             if det_count > 0:
-                # Strong boost if it matched the exact full query (class index 0)
-                if best_class_idx == 0:
-                    candidate["score"] = candidate.get("score", 0) + max_conf * 0.8
-                # Minor boost if it only matched the fallback noun
-                else:
-                    candidate["score"] = candidate.get("score", 0) + max_conf * 0.3
-                    
+                # Strong boost for the exact query; smaller boost for its noun.
+                boost = 0.8 if best_class_idx == 0 else 0.3
+                candidate["score"] = candidate.get("score", 0) + max_conf * boost
                 candidate["yolo_world_match"] = True
                 candidate["yolo_world_conf"] = max_conf
                 candidate["yolo_world_count"] = det_count
             else:
-                # SOFT penalty: YOLO-World didn't find the object, but small
-                # objects (rings, patterns) can escape open-vocab detection.
-                # 0.35 is aggressive enough to demote non-matches below verified
-                # ones but leaves them visible when nothing else matched.
+                # Preserve possible small/rare CLIP matches but demote them.
                 candidate["score"] = candidate.get("score", 0) * 0.35
                 candidate["yolo_world_match"] = False
-
-        except Exception as e:
-            print(f"[search] YOLO-World error on {target_path}: {e}")
 
     # Re-sort by updated score
     candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -247,10 +332,18 @@ _PROMPT_TEMPLATES = (
 
 def _prompt_ensemble_embedding(query: str) -> np.ndarray:
     """Average CLIP text embeddings over a small template ensemble."""
+    attributes, _ = _parse_query_attributes(query)
     embs = []
     for tmpl in _PROMPT_TEMPLATES:
         try:
-            embs.append(_blend_attributes(tmpl.format(q=query)))
+            prompted_query = tmpl.format(q=query)
+            query_emb = models.encode_text_clip(prompted_query)
+            if attributes:
+                prompted_attributes = tmpl.format(q=attributes)
+                attr_emb = models.encode_text_clip(prompted_attributes)
+                query_emb = (query_emb * 0.6) + (attr_emb * 0.4)
+                query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
+            embs.append(query_emb)
         except Exception as e:
             print(f"[search] prompt ensemble error on '{tmpl}': {e}")
     if not embs:
@@ -281,6 +374,17 @@ def _get_query_embedding(query: str) -> np.ndarray:
         return _prompt_ensemble_embedding(query)
 
 
+def _video_group_key(result: dict):
+    """Return a stable identity for grouping results from one video."""
+    video_id = result.get("video_id")
+    if video_id is not None:
+        return ("id", str(video_id))
+    video_path = result.get("video_path")
+    if video_path:
+        return ("path", os.path.normcase(os.path.abspath(video_path)))
+    return ("filename", str(result.get("video_filename") or ""))
+
+
 def _apply_temporal_boosting(results: list) -> list:
     """
     STAGE 2.5/3: TEMPORAL CONTINUITY BOOST (Option 5)
@@ -292,7 +396,7 @@ def _apply_temporal_boosting(results: list) -> list:
         
     video_map = {}
     for r in results:
-        vid = r.get("video_filename")
+        vid = _video_group_key(r)
         if vid not in video_map:
             video_map[vid] = []
         video_map[vid].append(r)
@@ -318,6 +422,7 @@ def _apply_temporal_boosting(results: list) -> list:
     return results
 
 
+@_timed_operation("text_search")
 def search(query: str, top_k: int = None, mode: str = "hybrid"):
     """
     3-Stage Smart Search:
@@ -414,8 +519,12 @@ def search(query: str, top_k: int = None, mode: str = "hybrid"):
     # Only re-rank top candidates for speed, but ensure we have enough
     # ================================================================
     if results and mode in ("clip", "hybrid"):
-        # Re-rank the number of results requested by the user
-        candidates_to_rerank = results[:top_k]
+        # Keep a larger recall pool so open-vocabulary verification can rescue
+        # relevant CLIP candidates that initially rank just below top_k.
+        rerank_factor = max(1, int(getattr(config, "YOLO_WORLD_RERANK_FACTOR", 3)))
+        rerank_cap = max(top_k, int(getattr(config, "YOLO_WORLD_MAX_CANDIDATES", 60)))
+        rerank_count = min(len(results), top_k * rerank_factor, rerank_cap)
+        candidates_to_rerank = results[:rerank_count]
         print(f"[search] Stage 2 YOLO-World: re-ranking {len(candidates_to_rerank)} candidates")
         
         # We only keep the ones that survived re-ranking
@@ -483,6 +592,38 @@ def _rerank_by_color(results, query_image: Image.Image, weight: float = 0.4):
     return results
 
 
+def _build_image_query_variants(image: Image.Image, yolo_results) -> list[Image.Image]:
+    """Return the full query image plus the largest detected object crops.
+
+    A query photo can contain several relevant objects, so encoding only the
+    largest box can silently search for the wrong subject. Ultralytics already
+    applies NMS; sorting by area gives a small, deterministic query batch.
+    """
+    crop_candidates = []
+    image_width, image_height = image.size
+    for result in yolo_results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            x1 = max(0, min(x1, image_width))
+            y1 = max(0, min(y1, image_height))
+            x2 = max(0, min(x2, image_width))
+            y2 = max(0, min(y2, image_height))
+            area = (x2 - x1) * (y2 - y1)
+            if area > 0:
+                crop_candidates.append((area, (x1, y1, x2, y2)))
+
+    crop_candidates.sort(key=lambda item: item[0], reverse=True)
+    max_objects = max(1, int(getattr(config, "IMAGE_SEARCH_MAX_OBJECTS", 3)))
+    object_crops = [image.crop(bounds) for _, bounds in crop_candidates[:max_objects]]
+
+    variants = []
+    if getattr(config, "IMAGE_SEARCH_INCLUDE_FULL_IMAGE", True) or not object_crops:
+        variants.append(image)
+    variants.extend(object_crops)
+    return variants
+
+
+@_timed_operation("image_search")
 def search_by_image(image: Image.Image, top_k: int = None):
     """
     Search by image — encode uploaded image with CLIP, find nearest matches in FAISS.
@@ -511,38 +652,30 @@ def search_by_image(image: Image.Image, top_k: int = None):
         yolo_model = _load_image_search_yolo()
         yolo_results = yolo_model(cv_img, conf=config.IMAGE_SEARCH_YOLO_CONFIDENCE, verbose=False)
         
-        max_area = 0
-        
-        for r in yolo_results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                area = (x2 - x1) * (y2 - y1)
-                # Find the largest bounding box
-                if area > max_area:
-                    max_area = area
-                    best_crop = image.crop((x1, y1, x2, y2))
-                    
+        query_images = _build_image_query_variants(image, yolo_results)
+        best_crop = query_images[1] if len(query_images) > 1 else None
         if best_crop:
-            print("[search] Found primary object, cropping background.")
-            query_emb = models.encode_images_clip([best_crop])
+            print(f"[search] Encoding {len(query_images) - 1} object crops plus the full image.")
         else:
             print("[search] No clear object found, using full image.")
-            query_emb = models.encode_images_clip([image])
+        query_embeddings = models.encode_images_clip(query_images)
 
         n_candidates = min(
             max(top_k * config.IMAGE_CANDIDATE_POOL_FACTOR, config.IMAGE_MIN_CANDIDATES),
             index.ntotal,
         )
-        scores, indices = index.search(query_emb, n_candidates)
+        score_map = {}
+        for query_embedding in query_embeddings:
+            scores, indices = index.search(query_embedding.reshape(1, -1), n_candidates)
+            for i in range(len(indices[0])):
+                faiss_id = int(indices[0][i])
+                score = float(scores[0][i])
+                if faiss_id >= 0 and score >= min_clip_score:
+                    score_map[faiss_id] = max(score_map.get(faiss_id, float("-inf")), score)
 
-        valid = [(int(indices[0][i]), float(scores[0][i]))
-                 for i in range(len(indices[0]))
-                 if indices[0][i] >= 0 and float(scores[0][i]) >= min_clip_score]
-
-        faiss_ids = [fid for fid, _ in valid]
-        score_map = {fid: score for fid, score in valid}
-
-        print(f"[search] Image search: {len(valid)} matches (threshold {min_clip_score})")
+        faiss_ids = list(score_map)
+        print(f"[search] Image search: {len(faiss_ids)} unique matches "
+              f"from {len(query_images)} query variants (threshold {min_clip_score})")
 
         if faiss_ids:
             det_results = db.get_detections_by_faiss_ids(faiss_ids)
@@ -623,12 +756,38 @@ def _normalize_lighting_pil(image: Image.Image) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(normalized, cv2.COLOR_BGR2RGB))
 
 
+def _build_person_query_variants(image: Image.Image) -> list[dict]:
+    """Build person-query variants with explicit orientation metadata."""
+    if getattr(config, "PERSON_MULTI_ORIENTATION", False):
+        orientations = _generate_query_orientations(image)
+        print(f"[search] Multi-orientation: {len(orientations)} variants")
+    else:
+        orientations = [image]
+
+    variants = []
+    for orientation_index, oriented_image in enumerate(orientations):
+        variants.append({
+            "image": oriented_image,
+            "label": f"orient_{orientation_index}",
+            "is_original": orientation_index == 0,
+            "is_lighting_normalized": False,
+        })
+        if getattr(config, "PERSON_LIGHTING_NORMALIZE", False):
+            variants.append({
+                "image": _normalize_lighting_pil(oriented_image),
+                "label": f"orient_{orientation_index}_clahe",
+                "is_original": orientation_index == 0,
+                "is_lighting_normalized": True,
+            })
+    return variants
+
+
 def _search_clip_fallback_person(image: Image.Image, top_k: int,
                                   seen_keys: set) -> list:
     """Layer 3: Search the general CLIP index for person-class detections.
 
     CLIP was trained on 400M image-text pairs and is far more robust to extreme
-    viewpoint and lighting changes than DINOv2.  Results are returned at a lower
+    viewpoint and lighting changes than OSNet. Results are returned at a lower
     confidence tier (CLIP_FALLBACK_SCORE_WEIGHT) so they never outrank true
     biometric matches but still surface the person when all else fails.
     """
@@ -678,6 +837,7 @@ def _search_clip_fallback_person(image: Image.Image, top_k: int,
     return results
 
 
+@_timed_operation("person_search")
 def search_by_person(image: Image.Image, top_k: int = None):
     """Search by person photo — find this specific person across all indexed videos.
 
@@ -693,7 +853,7 @@ def search_by_person(image: Image.Image, top_k: int = None):
              due to extreme viewpoint/resolution differences.
 
     Biometric models used:
-    1. DINOv2 (Body Re-ID) — matches clothing, build, and gait patterns.
+    1. OSNet (Body Re-ID) — matches clothing, build, and appearance patterns.
     2. FaceNet (Face ID) — matches bone structure and facial landmarks.
 
     Score hierarchy:  face+body > face > body > CLIP visual
@@ -707,21 +867,10 @@ def search_by_person(image: Image.Image, top_k: int = None):
     # ------------------------------------------------------------------
     # Build query variants (Layer 1 + Layer 2)
     # ------------------------------------------------------------------
-    if getattr(config, "PERSON_MULTI_ORIENTATION", False):
-        orientations = _generate_query_orientations(image)
-        print(f"[search] Multi-orientation: {len(orientations)} variants")
-    else:
-        orientations = [image]
-
-    # For each orientation, optionally create a CLAHE-normalized copy
-    query_variants = []  # list of (PIL image, label)
-    for i, orient_img in enumerate(orientations):
-        query_variants.append((orient_img, f"orient_{i}"))
-        if getattr(config, "PERSON_LIGHTING_NORMALIZE", False):
-            query_variants.append((_normalize_lighting_pil(orient_img), f"orient_{i}_clahe"))
+    query_variants = _build_person_query_variants(image)
 
     print(f"[search] Total query variants: {len(query_variants)} "
-          f"(orientations={'on' if len(orientations) > 1 else 'off'}, "
+          f"(orientations={'on' if getattr(config, 'PERSON_MULTI_ORIENTATION', False) else 'off'}, "
           f"CLAHE={'on' if getattr(config, 'PERSON_LIGHTING_NORMALIZE', False) else 'off'})")
 
     # ------------------------------------------------------------------
@@ -734,12 +883,12 @@ def search_by_person(image: Image.Image, top_k: int = None):
     # people with HIGH confidence, poisoning the results.
     #
     # Strategy: Face matching works on the image AS UPLOADED.
-    # All 8 rotated variants are handled by DINOv2 body Re-ID only.
+    # All 8 rotated variants are handled by OSNet body Re-ID only.
     # ------------------------------------------------------------------
     face_variants = []  # list of (cv_img_bgr, face_bbox, is_face_crop, variant_label)
 
     # Only process the original orientation for face detection
-    original_pil = query_variants[0][0]  # orient_0
+    original_pil = query_variants[0]["image"]  # orient_0
     cv_img = cv2.cvtColor(np.array(original_pil), cv2.COLOR_RGB2BGR)
     h, w = cv_img.shape[:2]
     img_area = h * w
@@ -772,13 +921,13 @@ def search_by_person(image: Image.Image, top_k: int = None):
                 break
 
     # ------------------------------------------------------------------
-    # Stage 1: DINOv2 Body Re-ID across all orientations (batch-encoded)
+    # Stage 1: OSNet Body Re-ID across all orientations (batch-encoded)
     # ------------------------------------------------------------------
     person_index = _get_cached_faiss(config.PERSON_FAISS_INDEX_PATH)
 
     if not original_is_face_crop and person_index is not None and person_index.ntotal > 0:
-        # Batch-encode ALL variants with DINOv2 in a single GPU call
-        body_images = [img for img, _ in query_variants]
+        # Batch-encode all variants in a single Re-ID call.
+        body_images = [variant["image"] for variant in query_variants]
         body_embeddings = models.encode_person_reid(body_images)
 
         n_candidates = min(
@@ -792,8 +941,7 @@ def search_by_person(image: Image.Image, top_k: int = None):
             query_emb = body_embeddings[emb_idx:emb_idx+1]
             scores, indices = person_index.search(query_emb, n_candidates)
             
-            # Determine if this is the original orientation (first two in the list: orient_0 + clahe)
-            is_original = (emb_idx < 2)
+            is_original = query_variants[emb_idx]["is_original"]
             threshold = config.PERSON_MATCH_THRESHOLD if is_original else config.PERSON_MATCH_THRESHOLD_RELAXED
             discount = 1.0 if is_original else config.BODY_ROTATED_DISCOUNT
 
@@ -995,7 +1143,7 @@ def _format_detection_result(row, source="text"):
         "confidence": r.get("confidence", 0),
         "caption": r.get("caption", ""),
         "bbox": [r.get("bbox_x1", 0), r.get("bbox_y1", 0),
-                 r.get("bbox_x2", 0), r.get("bbox_y2", 0)] if r.get("bbox_x1") else None,
+             r.get("bbox_x2", 0), r.get("bbox_y2", 0)] if r.get("bbox_x1") is not None else None,
         "score": score,
     }
 
@@ -1036,15 +1184,15 @@ def _cluster_near_duplicates(results: list, window_frames: int = 2) -> list:
         return results
 
     # Sort deterministically by (video, timestamp) so adjacent frames are neighbours.
-    ordered = sorted(results, key=lambda r: (r.get("video_filename") or "",
+    ordered = sorted(results, key=lambda r: (_video_group_key(r),
                                              float(r.get("frame_number") or 0)))
     kept: list = []
     for r in ordered:
-        vid = r.get("video_filename")
+        vid = _video_group_key(r)
         fno = float(r.get("frame_number") or 0)
         merged = False
         for k in kept:
-            if k.get("video_filename") == vid and abs(float(k.get("frame_number") or 0) - fno) <= window_frames:
+            if _video_group_key(k) == vid and abs(float(k.get("frame_number") or 0) - fno) <= window_frames:
                 # Prefer higher-scored representative; append the loser to _cluster.
                 loser = r if k.get("score", 0) >= r.get("score", 0) else k
                 winner = k if loser is r else r

@@ -160,16 +160,19 @@ def _load_yolo():
     return _yolo_model
 
 
-def detect_objects(frame_bgr: np.ndarray) -> list:
+def detect_objects(frame_bgr: np.ndarray, classes: list | None = None,
+                   confidence: float | None = None) -> list:
     """
     Run YOLO detection on a frame.
     Returns list of dicts: {class_name, confidence, bbox: (x1,y1,x2,y2)}
     """
     model = _load_yolo()
+    effective_classes = config.YOLO_CLASSES if classes is None else classes
+    effective_confidence = config.YOLO_CONFIDENCE if confidence is None else confidence
     results = model(
         frame_bgr, 
-        conf=config.YOLO_CONFIDENCE, 
-        classes=config.YOLO_CLASSES,
+        conf=effective_confidence,
+        classes=effective_classes,
         half=True,
         verbose=False
     )
@@ -185,16 +188,20 @@ def detect_objects(frame_bgr: np.ndarray) -> list:
     return detections
 
 
-def detect_objects_batch(frames_bgr: list) -> list:
+def detect_objects_batch(frames_bgr: list, classes: list | None = None,
+                         confidence: float | None = None) -> list:
     """
     Run YOLO detection on a batch of frames.
     Returns list of lists of detections.
     """
     model = _load_yolo()
     if not frames_bgr: return []
+    effective_classes = config.YOLO_CLASSES if classes is None else classes
+    effective_confidence = config.YOLO_CONFIDENCE if confidence is None else confidence
     # stream=False is REQUIRED for batch inference. stream=True forces sequential processing!
     # Explicitly setting batch size is REQUIRED to prevent Ultralytics from defaulting to batch=1
-    results = model(frames_bgr, conf=config.YOLO_CONFIDENCE, classes=config.YOLO_CLASSES, half=True, verbose=False, stream=False, batch=len(frames_bgr))
+    results = model(frames_bgr, conf=effective_confidence, classes=effective_classes,
+                    half=True, verbose=False, stream=False, batch=len(frames_bgr))
     batch_dets = []
     for r in results:
         dets = []

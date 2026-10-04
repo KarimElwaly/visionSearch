@@ -43,6 +43,8 @@ YOLO_MODEL_PATH = os.path.join(os.path.dirname(BASE_DIR), "yolo11n.pt")
 YOLO_CONFIDENCE = 0.3
 YOLO_CLASSES = None  # None = all 80 COCO classes. Use [0] for person-only.
 IMAGE_SEARCH_YOLO_CONFIDENCE = 0.2
+IMAGE_SEARCH_MAX_OBJECTS = 3
+IMAGE_SEARCH_INCLUDE_FULL_IMAGE = True
 
 # YOLO-Face detection (for face cropping during indexing)
 YOLO_FACE_MODEL_PATH = os.path.join(os.path.dirname(BASE_DIR), "yolo11n-face.pt")
@@ -51,6 +53,12 @@ FACE_DETECTION_CONFIDENCE = 0.4
 # YOLO-World (open-vocabulary detection — used at search time for re-ranking)
 YOLO_WORLD_MODEL_PATH = os.path.join(os.path.dirname(BASE_DIR), "yolov8m-worldv2.pt")
 YOLO_WORLD_CONFIDENCE = 0.15
+YOLO_WORLD_RERANK_FACTOR = 3
+YOLO_WORLD_MAX_CANDIDATES = 60
+YOLO_WORLD_BATCH_SIZE = 8
+YOLO_WORLD_IMAGE_SIZE = 640
+YOLO_WORLD_DEVICE = "auto"  # auto prefers CUDA and falls back to CPU
+YOLO_WORLD_WARMUP = True
 
 # CLIP model — ViT-L/14 is much better at colors, clothing, fine-grained attributes
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"

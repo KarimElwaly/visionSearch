@@ -286,7 +286,8 @@ def crop_detection(frame_bgr: np.ndarray, bbox: tuple, pad_ratio: float = 0.1) -
     return Image.fromarray(crop)
 
 
-def _detect_track_crop_batch(mega_batch, object_tracker, io_executor, video_frames_dir):
+def _detect_track_crop_batch(mega_batch, object_tracker, io_executor, video_frames_dir,
+                             yolo_classes=None, yolo_confidence=None):
     """Run YOLO + IoU tracker + crop persistence for one mega-batch.
 
     Mutates each ``mb`` in ``mega_batch`` in place by setting ``detections``,
@@ -299,7 +300,11 @@ def _detect_track_crop_batch(mega_batch, object_tracker, io_executor, video_fram
         return 0
 
     bgr_frames = [mb["frame_bgr_ref"] for mb in mega_batch]
-    batch_dets = models.detect_objects_batch(bgr_frames)
+    batch_dets = models.detect_objects_batch(
+        bgr_frames,
+        classes=yolo_classes,
+        confidence=yolo_confidence,
+    )
 
     total = 0
     for mb, dets in zip(mega_batch, batch_dets):
@@ -536,65 +541,56 @@ def index_video(video_path: str, use_vlm: bool = False, use_clip: bool = True,
     diagnosed or reindexed later, and we reset ``indexing_status`` so the
     UI recovers.
 
-    Per-job overrides:
-        ``yolo_classes`` and ``yolo_confidence`` temporarily mutate the
-        corresponding ``config`` module attributes for the lifetime of
-        this call, then restore them in a ``finally`` block. This lets
-        the caller (POST /api/index) change detection settings for the
-        next job after a cancel, without restarting the process.
+    Per-job YOLO overrides are passed explicitly through the inference call so
+    concurrent requests cannot leak detector settings into one another.
     """
     global indexing_status
     _pre_video_path = os.path.abspath(video_path)
     _existing = db.get_video_by_path(_pre_video_path)
 
-    # --- per-job config overrides (restored in finally) ---
-    _original_classes = config.YOLO_CLASSES
-    _original_conf = config.YOLO_CONFIDENCE
-    try:
-        if yolo_classes is not None:
-            config.YOLO_CLASSES = list(yolo_classes)
-            print(f"[indexer] Override YOLO_CLASSES = {config.YOLO_CLASSES}")
-        if yolo_confidence is not None:
-            config.YOLO_CONFIDENCE = float(yolo_confidence)
-            print(f"[indexer] Override YOLO_CONFIDENCE = {config.YOLO_CONFIDENCE}")
+    effective_classes = config.YOLO_CLASSES if yolo_classes is None else list(yolo_classes)
+    effective_confidence = config.YOLO_CONFIDENCE if yolo_confidence is None else float(yolo_confidence)
+    if yolo_classes is not None:
+        print(f"[indexer] Job YOLO classes: {effective_classes}")
+    if yolo_confidence is not None:
+        print(f"[indexer] Job YOLO confidence: {effective_confidence}")
 
+    try:
+        return _index_video_impl(
+            video_path,
+            use_vlm=use_vlm,
+            use_clip=use_clip,
+            camera_id=camera_id,
+            location=location,
+            recording_start_time=recording_start_time,
+            timezone=timezone,
+            index_profile=index_profile,
+            yolo_classes=effective_classes,
+            yolo_confidence=effective_confidence,
+        )
+    except IndexingCancelled:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         try:
-            return _index_video_impl(
-                video_path,
-                use_vlm=use_vlm,
-                use_clip=use_clip,
-                camera_id=camera_id,
-                location=location,
-                recording_start_time=recording_start_time,
-                timezone=timezone,
-                index_profile=index_profile,
-            )
-        except IndexingCancelled:
-            # Not an error path \u2014 request_cancel() sets status via the impl.
-            raise
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            try:
-                vid_row = db.get_video_by_path(_pre_video_path) or _existing
-                if vid_row is not None:
-                    db.set_video_error(int(vid_row["id"]), f"{type(e).__name__}: {e}")
-            except Exception as inner:
-                print(f"[indexer] failed to persist error state: {inner}")
-            indexing_status.update({
-                "active": False,
-                "cancel_requested": False,
-                "message": f"FAILED: {type(e).__name__}: {e}",
-            })
-            return
-    finally:
-        config.YOLO_CLASSES = _original_classes
-        config.YOLO_CONFIDENCE = _original_conf
+            vid_row = db.get_video_by_path(_pre_video_path) or _existing
+            if vid_row is not None:
+                db.set_video_error(int(vid_row["id"]), f"{type(e).__name__}: {e}")
+        except Exception as inner:
+            print(f"[indexer] failed to persist error state: {inner}")
+        indexing_status.update({
+            "active": False,
+            "cancel_requested": False,
+            "message": f"FAILED: {type(e).__name__}: {e}",
+        })
+        return "failed"
 
 
 def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = True,
                       camera_id: str = None, location: str = None, recording_start_time: str = None,
-                      timezone: str = None, index_profile: str = None):
+                      timezone: str = None, index_profile: str = None,
+                      yolo_classes: list = None, yolo_confidence: float = None):
     """
     Index a video FAST \u2014 CLIP embeddings + YOLO crops only.
 
@@ -612,7 +608,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
     existing = db.get_video_by_path(video_path)
     if existing and existing["status"] == "done":
         indexing_status["message"] = f"Already indexed: {filename}"
-        return
+        return "skipped"
 
     cap = cv2.VideoCapture(video_path)
     video_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -724,28 +720,51 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
 
     frame_queue = queue.Queue(maxsize=128)
     extractor_error: list = []
+    extractor_stop = threading.Event()
+
+    def _put_extracted(item) -> bool:
+        while not extractor_stop.is_set():
+            try:
+                frame_queue.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _extractor():
         try:
             for fno, ts, fb in extract_frames(video_path, fps=extract_fps, start_frame=resume_from):
-                frame_queue.put((fno, ts, fb))
+                if not _put_extracted((fno, ts, fb)):
+                    break
         except Exception as exc:
             extractor_error.append(exc)
         finally:
             # Sentinel MUST be enqueued no matter what \u2014 otherwise the consumer
             # loop blocks forever on frame_queue.get().
-            frame_queue.put(None)
+            if not extractor_stop.is_set():
+                _put_extracted(None)
 
-    threading.Thread(target=_extractor, daemon=True).start()
+    extractor_thread = threading.Thread(
+        target=_extractor,
+        daemon=True,
+        name=f"extract-{video_id}",
+    )
+    extractor_thread.start()
 
     while True:
         # Honour cooperative cancellation from POST /api/index/cancel.
         if indexing_status.get("cancel_requested"):
             cancelled = True
             print("[indexer] cancel requested \u2014 stopping after current batch")
+            extractor_stop.set()
             break
 
-        data = frame_queue.get()
+        try:
+            data = frame_queue.get(timeout=0.2)
+        except queue.Empty:
+            if not extractor_thread.is_alive():
+                break
+            continue
         if data is None: break
 
         frame_no, timestamp, frame_bgr = data
@@ -779,7 +798,8 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
         # Process and flush mega-batch when full
         if len(mega_batch) >= config.CLIP_MEGA_BATCH:
             total_detections += _detect_track_crop_batch(
-                mega_batch, object_tracker, io_executor, video_frames_dir
+                mega_batch, object_tracker, io_executor, video_frames_dir,
+                yolo_classes=yolo_classes, yolo_confidence=yolo_confidence,
             )
 
             _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
@@ -821,10 +841,16 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
                 "message": status_msg,
             })
 
+    extractor_stop.set()
+    extractor_thread.join(timeout=5.0)
+    if extractor_thread.is_alive():
+        print(f"[indexer] extractor thread did not stop within 5 seconds: {filename}")
+
     # Flush remaining frames
     if mega_batch and not cancelled:
         total_detections += _detect_track_crop_batch(
-            mega_batch, object_tracker, io_executor, video_frames_dir
+            mega_batch, object_tracker, io_executor, video_frames_dir,
+            yolo_classes=yolo_classes, yolo_confidence=yolo_confidence,
         )
 
         _flush_mega_batch(mega_batch, faiss_index, person_faiss_index, face_faiss_index,
@@ -864,7 +890,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
             "frames_processed": processed,
         })
         print(f"[indexer] CANCELLED: {filename} at frame {processed}")
-        return
+        return "cancelled"
 
     # --- Final summary ---
     speed_ratio = duration / elapsed_total if elapsed_total > 0 else 0
@@ -900,6 +926,7 @@ def _index_video_impl(video_path: str, use_vlm: bool = False, use_clip: bool = T
         "message": done_msg,
         "frames_processed": processed,
     })
+    return "done"
 
 
 def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
@@ -912,7 +939,7 @@ def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
               for f in fs if os.path.splitext(f)[1].lower() in exts]
     for i, vp in enumerate(videos):
         indexing_status["message"] = f"Video {i + 1}/{len(videos)}: {os.path.basename(vp)}"
-        index_video(
+        outcome = index_video(
             vp,
             use_vlm=use_vlm,
             use_clip=use_clip,
@@ -924,6 +951,9 @@ def index_directory(dir_path: str, use_vlm: bool = False, use_clip: bool = True,
             yolo_classes=yolo_classes,
             yolo_confidence=yolo_confidence,
         )
+        if outcome == "cancelled":
+            print(f"[indexer] directory indexing cancelled after {os.path.basename(vp)}")
+            break
 
 
 def _remove_ids_from_index(path: str, ids: list, dim: int, use_flat: bool = False) -> int:

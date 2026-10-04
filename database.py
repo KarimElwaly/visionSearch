@@ -17,6 +17,7 @@ def get_connection() -> sqlite3.Connection:
         _local.conn.execute("PRAGMA synchronous=NORMAL")
         _local.conn.execute("PRAGMA foreign_keys=ON")
         _local.conn.execute("PRAGMA temp_store=MEMORY")
+        _local.conn.execute("PRAGMA busy_timeout=5000")
     return _local.conn
 
 
@@ -538,17 +539,30 @@ def add_frame_embedding(frame_id: int, faiss_id: int, caption: str = None) -> in
 
 # ---- Batch Inserts (single-transaction for speed) ----
 
+def _insert_many_returning_ids(conn: sqlite3.Connection, insert_prefix: str,
+                               placeholder: str, rows: list,
+                               chunk_size: int) -> list[int]:
+    """Insert rows in multi-value chunks and return generated IDs in row order."""
+    ids = []
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start:start + chunk_size]
+        sql = f"{insert_prefix} VALUES {','.join([placeholder] * len(chunk))} RETURNING id"
+        params = [value for row in chunk for value in row]
+        returned = conn.execute(sql, params).fetchall()
+        ids.extend(sorted(int(row[0]) for row in returned))
+    return ids
+
 def batch_add_frames(rows: list) -> list:
     """Insert many frames in one transaction. Each row: (video_id, frame_number, timestamp, frame_path).
     Returns list of rowids in insertion order."""
+    if not rows:
+        return []
     with get_db() as conn:
-        ids = []
-        for r in rows:
-            cur = conn.execute(
-                "INSERT INTO frames (video_id, frame_number, timestamp, frame_path) VALUES (?, ?, ?, ?)", r
-            )
-            ids.append(cur.lastrowid)
-        return ids
+        return _insert_many_returning_ids(
+            conn,
+            "INSERT INTO frames (video_id, frame_number, timestamp, frame_path)",
+            "(?, ?, ?, ?)", rows, chunk_size=200,
+        )
 
 
 def batch_add_frame_embeddings(rows: list):
@@ -563,16 +577,15 @@ def batch_add_detections(rows: list):
     """Insert many detections in one transaction.
     Each row: (frame_id, class_name, confidence, x1, y1, x2, y2, crop_path, faiss_id, caption).
     Returns list of rowids."""
+    if not rows:
+        return []
     with get_db() as conn:
-        ids = []
-        for r in rows:
-            cur = conn.execute(
-                """INSERT INTO detections
-                   (frame_id, class_name, confidence, bbox_x1, bbox_y1, bbox_x2, bbox_y2, crop_path, faiss_id, caption)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", r
-            )
-            ids.append(cur.lastrowid)
-        return ids
+        return _insert_many_returning_ids(
+            conn,
+            """INSERT INTO detections
+               (frame_id, class_name, confidence, bbox_x1, bbox_y1, bbox_x2, bbox_y2, crop_path, faiss_id, caption)""",
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows, chunk_size=90,
+        )
 
 
 def update_detection_person_faiss_id(detection_id: int, person_faiss_id: int):

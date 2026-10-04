@@ -12,4 +12,7 @@ requests
 numpy
 ultralytics
 facenet-pytorch
+onnx
+onnxruntime
+huggingface-hub
 git+https://github.com/openai/CLIP.git

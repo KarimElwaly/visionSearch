@@ -4,7 +4,7 @@ import asyncio
 import csv
 import json
 from io import StringIO
-from threading import Thread
+from threading import Lock, Thread
 from fastapi import FastAPI, BackgroundTasks, Query, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -40,6 +40,8 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Vision-Search Agent", version="1.0", lifespan=lifespan)
+_index_job_lock = Lock()
+_index_job_thread: Thread | None = None
 
 
 # ---- API Models ----
@@ -53,10 +55,8 @@ class IndexRequest(BaseModel):
     recording_start_time: str | None = None
     timezone: str | None = None
     index_profile: str | None = None
-    # Optional per-job overrides. Applied to the config module for the duration
-    # of one indexing run and restored on finish/cancel/error, so you can
-    # cancel a running job, POST /api/index with different classes/confidence,
-    # and have the resume honour the new settings without restarting Uvicorn.
+    # Optional per-job overrides are passed directly into detector inference;
+    # they never mutate process-global model configuration.
     yolo_classes: list[int] | None = None
     yolo_confidence: float | None = None
 
@@ -289,43 +289,55 @@ async def api_search_by_person(
 @app.post("/api/index")
 async def api_index(req: IndexRequest, background_tasks: BackgroundTasks):
     """Start indexing a video file or directory."""
+    global _index_job_thread
     path = req.path.strip()
     if not os.path.exists(path):
         return JSONResponse(status_code=400, content={"error": f"Path not found: {path}"})
-    
-    if indexer.indexing_status["active"]:
-        return JSONResponse(status_code=409, content={"error": "Indexing already in progress"})
-    
+
     def _run():
-        if os.path.isdir(path):
-            indexer.index_directory(
-                path,
-                use_vlm=req.use_vlm,
-                use_clip=req.use_clip,
-                camera_id=req.camera_id,
-                location=req.location,
-                recording_start_time=req.recording_start_time,
-                timezone=req.timezone,
-                index_profile=req.index_profile,
-                yolo_classes=req.yolo_classes,
-                yolo_confidence=req.yolo_confidence,
-            )
-        else:
-            indexer.index_video(
-                path,
-                use_vlm=req.use_vlm,
-                use_clip=req.use_clip,
-                camera_id=req.camera_id,
-                location=req.location,
-                recording_start_time=req.recording_start_time,
-                timezone=req.timezone,
-                index_profile=req.index_profile,
-                yolo_classes=req.yolo_classes,
-                yolo_confidence=req.yolo_confidence,
-            )
-    
-    thread = Thread(target=_run, daemon=True)
-    thread.start()
+        global _index_job_thread
+        try:
+            if os.path.isdir(path):
+                indexer.index_directory(
+                    path,
+                    use_vlm=req.use_vlm,
+                    use_clip=req.use_clip,
+                    camera_id=req.camera_id,
+                    location=req.location,
+                    recording_start_time=req.recording_start_time,
+                    timezone=req.timezone,
+                    index_profile=req.index_profile,
+                    yolo_classes=req.yolo_classes,
+                    yolo_confidence=req.yolo_confidence,
+                )
+            else:
+                indexer.index_video(
+                    path,
+                    use_vlm=req.use_vlm,
+                    use_clip=req.use_clip,
+                    camera_id=req.camera_id,
+                    location=req.location,
+                    recording_start_time=req.recording_start_time,
+                    timezone=req.timezone,
+                    index_profile=req.index_profile,
+                    yolo_classes=req.yolo_classes,
+                    yolo_confidence=req.yolo_confidence,
+                )
+        finally:
+            with _index_job_lock:
+                _index_job_thread = None
+            indexer.indexing_status["active"] = False
+
+    with _index_job_lock:
+        if _index_job_thread is not None and _index_job_thread.is_alive():
+            return JSONResponse(status_code=409, content={"error": "Indexing already in progress"})
+        indexer.indexing_status.update({
+            "active": True,
+            "cancel_requested": False,
+            "message": f"Starting indexing: {path}",
+        })
+        _index_job_thread = Thread(target=_run, daemon=True)
+        _index_job_thread.start()
     
     return {"message": f"Indexing started: {path}"}
 
